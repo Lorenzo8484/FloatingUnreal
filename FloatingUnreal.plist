@@ -1,1 +1,1 @@
-{ Filter = { Bundles = ( "com.epicgames.fortnite", "com.pubg.imobile", "com.netease.mracecar", "com.tencent.ig" ); }; }
+{ Filter = { Bundles = ( "com.zeptolab.bulletecho" ); }; }
