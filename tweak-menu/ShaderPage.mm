@@ -2266,13 +2266,28 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
             [patched addObject:e];
     }
 
-    // 2. Azzera solo i flag attivi — isSaved e _savedPatchCache rimangono intatti
+    // 2. Azzera i flag attivi — preserva isSaved e customName ma cancella i patch
+    //    CRITICO: deve anche aggiornare _savedPatchCache + NSUserDefaults, altrimenti
+    //    al prossimo riavvio addShaderWithName() ricarica i patch e va in crash loop.
     for (ShaderEntry *e in self.shaders) {
         e.patchFragColor     = FragPatchNone;
         e.patchFlash         = NO;
         e.patchVertex        = NO;
         e.patchShadeOverride = NO;
     }
+    // Wipe patch flags from _savedPatchCache (keep isSaved + customName for UI)
+    for (NSString *key in _savedPatchCache.allKeys) {
+        NSDictionary *old = _savedPatchCache[key];
+        _savedPatchCache[key] = @{
+            @"s": old[@"s"] ?: @NO,
+            @"c": @((NSInteger)FragPatchNone),
+            @"f": @NO,
+            @"v": @NO,
+            @"n": old[@"n"] ?: @"",
+        };
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:[_savedPatchCache copy]
+                                             forKey:kPatchDefaultsKey];
 
     // 3. Rimuovi GPU variant pipelines per ogni entry che aveva patch
     void (^handler)(ShaderEntry *) = self.patchChangedHandler;
