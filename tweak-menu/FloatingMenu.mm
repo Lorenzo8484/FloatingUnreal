@@ -199,6 +199,14 @@ static NSString *fmLogFilePath(void) {
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                           action:@selector(handlePan:)];
     [self.iconButton addGestureRecognizer:pan];
+
+    // Long press (0.6s) = EMERGENCY STOP: disable all shaders including unsaved ones.
+    // Useful when entering a match and the game is about to crash from an active patch.
+    UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:self action:@selector(iconLongPressed:)];
+    longPress.minimumPressDuration = 0.6;
+    [self.iconButton addGestureRecognizer:longPress];
+
     [self.menuWindow.rootViewController.view addSubview:self.iconButton];
 }
 
@@ -460,6 +468,48 @@ static NSString *fmLogFilePath(void) {
         [self addLog:@"[INFO] Shader Inspector aperto"];
     }
     self.isOpen = !self.isOpen;
+}
+
+// ── Long press: EMERGENCY STOP (all shaders OFF, hooks OFF) ──────────────────
+
+- (void)iconLongPressed:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+
+    // 1. Disable all Metal hooks (pass-through mode — no interception)
+    fmSetHooksEnabled(NO);
+    [self.shaderPage applyHookSwitchState:NO];
+
+    // 2. Deep reset C-level: clears activeColorHashes, flashHashes, colorLibraries,
+    //    flashLibraries, pipelinePatches, pipelineDescriptors, hash tables, variant dedup.
+    fmClearAllShaderPatches();
+
+    // 3. Reset all active patch flags in the UI (saved shaders remain in Memory tab).
+    [self.shaderPage resetActivePatchesOnly];
+
+    // 4. Close any open panel
+    [self closeDebugPanel];
+    if (self.isOpen) [self toggleMenu];
+
+    [self addLog:@"[KILL] â¡ Long press — EMERGENCY STOP: tutti i patch OFF, hook disattivati"];
+
+    // Vibrate for haptic confirmation (available iOS 10+)
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc]
+        initWithStyle:UIImpactFeedbackStyleHeavy];
+    [haptic prepare];
+    [haptic impactOccurred];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+        [haptic impactOccurred]; // double pulse
+    });
+
+    // Flash icon RED for 1s as visual confirmation
+    self.iconButton.layer.shadowColor = [UIColor colorWithRed:1.0 green:0.1 blue:0.1 alpha:1.0].CGColor;
+    self.iconButton.layer.shadowRadius = 20;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+        self.iconButton.layer.shadowColor = [UIColor colorWithRed:0.45 green:0.25 blue:1.0 alpha:1.0].CGColor;
+        self.iconButton.layer.shadowRadius = 12;
+    });
 }
 
 // ── Double-tap: safety force-OFF ─────────────────────────────────────────────
