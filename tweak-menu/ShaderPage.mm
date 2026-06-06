@@ -2067,11 +2067,48 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
         entry.subMembersText = structBody;
     }
 
-    // VGlobals
-    NSString *vgName = fmStructName(source, @"vglobals_type");
-    NSString *vgBody = fmStructBody(source, @"vglobals_type");
-    entry.vglobalsName = vgName ?: @"struct VGlobals_Type";
-    entry.vglobalsText = vgBody;
+    // ── VGlobals / Uniform-buffer struct ─────────────────────────────────────
+    // Strategy (same layered fallback as output struct):
+    //  1. UE HLSLCC name   "vglobals_type"
+    //  2. SPIRV-Cross names "type_globals", "_globals", "spvdescriptorset0"
+    //  3. Scan function params for  constant <Type>& ...  [[buffer(0)]]
+    //  4. Any remaining struct containing "globals" or "ubuffer" or "cbuffer" in its name
+    {
+        NSString *vgName = nil;
+        NSString *vgBody = nil;
+
+        // Pass 1: fixed hints
+        NSArray *vgHints = @[@"vglobals_type", @"type_globals", @"_globals",
+                             @"spvdescriptorset0", @"uniforms", @"cbuffer",
+                             @"ubuffer", @"pushconstants"];
+        for (NSString *h in vgHints) {
+            NSString *n2 = fmStructName(source, h);
+            NSString *b2 = fmStructBody(source, h);
+            if (b2) { vgName = n2; vgBody = b2; break; }
+        }
+
+        // Pass 2: parse "constant <StructType>& " from function parameter list
+        if (!vgBody) {
+            NSRegularExpression *re = [NSRegularExpression
+                regularExpressionWithPattern:@"constant\s+(\w+)\s*&"
+                options:NSRegularExpressionCaseInsensitive error:nil];
+            NSArray *matches = [re matchesInString:source options:0
+                                range:NSMakeRange(0, source.length)];
+            for (NSTextCheckingResult *m in matches) {
+                if (m.numberOfRanges < 2) continue;
+                NSString *typeName = [source substringWithRange:[m rangeAtIndex:1]];
+                NSString *typeHint = [typeName lowercaseString];
+                // Skip the output struct type we already found
+                if ([typeHint containsString:@"out"] || [typeHint containsString:@"in"]) continue;
+                NSString *n2 = fmStructName(source, typeHint);
+                NSString *b2 = fmStructBody(source, typeHint);
+                if (b2 && b2.length > 4) { vgName = n2; vgBody = b2; break; }
+            }
+        }
+
+        entry.vglobalsName = vgName ?: @"struct VGlobals_Type";
+        entry.vglobalsText = vgBody; // nil = no VGlobals column shown
+    }
 
     // ── Restore saved patch state (persists across game restarts) ──────────────
     NSDictionary *saved = _savedPatchCache[entry.stableKey];
