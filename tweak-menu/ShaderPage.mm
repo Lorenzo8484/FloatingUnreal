@@ -2008,12 +2008,64 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
     if (entry.hasFragmentFunction) entry.fragIndex = ++_fragCount;
     if (entry.hasVertexFunction)   entry.vertIndex = ++_vertCount;
 
-    // Struct name and body
-    NSString *hint = entry.hasFragmentFunction ? @"mtl_fragmentout" : @"mtl_vertexout";
-    NSString *structName = fmStructName(source, hint);
-    NSString *structBody = fmStructBody(source, hint);
-    entry.displayName   = structName ?: (entry.hasFragmentFunction ? @"struct Mtl_FragmentOut" : @"struct Mtl_VertexOut");
-    entry.subMembersText = structBody;
+    // ── Output struct (vertex/fragment out) ──────────────────────────────
+    // Strategy:
+    //  1. Try fixed hints "mtl_vertexout" / "mtl_fragmentout"
+    //  2. If that fails, parse the return type from the MSL function signature
+    //     (e.g. "vertex SomeOtherOut main0(...)" → hint = "someotherout")
+    //  3. If still nil, try common UE fallback names
+    {
+        NSString *primaryHint = entry.hasFragmentFunction ? @"mtl_fragmentout" : @"mtl_vertexout";
+        NSString *structName  = fmStructName(source, primaryHint);
+        NSString *structBody  = fmStructBody(source, primaryHint);
+
+        if (!structBody) {
+            // Fallback A: extract return type from "vertex|fragment <ReturnType> <funcName>("
+            NSString *funcKw  = entry.hasFragmentFunction ? @"fragment " : @"vertex ";
+            NSRange   funcPos = [lower rangeOfString:funcKw];
+            if (funcPos.location != NSNotFound) {
+                NSUInteger after = NSMaxRange(funcPos);
+                // skip leading whitespace
+                NSCharacterSet *ws2 = [NSCharacterSet whitespaceCharacterSet];
+                while (after < source.length && [ws2 characterIsMember:[source characterAtIndex:after]]) after++;
+                // read the return-type token (stops at whitespace, '<', '(', newline)
+                NSUInteger start = after;
+                while (after < source.length) {
+                    unichar c = [source characterAtIndex:after];
+                    if (c == ' ' || c == '\t' || c == '<' || c == '(' || c == '\n' || c == '\r') break;
+                    after++;
+                }
+                if (after > start) {
+                    NSString *retType  = [source substringWithRange:NSMakeRange(start, after - start)];
+                    NSString *retHint  = [retType lowercaseString];
+                    // Only use it if it doesn't look like a built-in void/half4/float4 etc.
+                    BOOL isBuiltin = [retHint hasPrefix:@"void"] || [retHint hasPrefix:@"float"]
+                                  || [retHint hasPrefix:@"half"]  || [retHint hasPrefix:@"int"]
+                                  || [retHint hasPrefix:@"uint"];
+                    if (!isBuiltin && retHint.length > 2) {
+                        NSString *n2 = fmStructName(source, retHint);
+                        NSString *b2 = fmStructBody(source, retHint);
+                        if (b2) { structName = n2; structBody = b2; }
+                    }
+                }
+            }
+        }
+
+        if (!structBody) {
+            // Fallback B: common alternative UE output struct name suffixes
+            NSArray *altHints = entry.hasFragmentFunction
+                ? @[@"_mtl_fragmentout", @"main_out", @"main0_out", @"ps_out", @"fsoutput", @"fragout"]
+                : @[@"_mtl_vertexout",   @"main_out", @"main0_out", @"vs_out", @"vsoutput",  @"vertout"];
+            for (NSString *alt in altHints) {
+                NSString *n2 = fmStructName(source, alt);
+                NSString *b2 = fmStructBody(source, alt);
+                if (b2) { structName = n2; structBody = b2; break; }
+            }
+        }
+
+        entry.displayName    = structName ?: (entry.hasFragmentFunction ? @"struct Mtl_FragmentOut" : @"struct Mtl_VertexOut");
+        entry.subMembersText = structBody;
+    }
 
     // VGlobals
     NSString *vgName = fmStructName(source, @"vglobals_type");
