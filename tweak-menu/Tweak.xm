@@ -593,46 +593,43 @@ static void rebuildVariantsForHash(NSNumber *hash) {
     }
     // Wait for all async Metal compiles — this blocks the background utility queue,
     // not the game's render thread.
-    dispatch_group_wait(buildGroup, DISPATCH_TIME_FOREVER);
+    // FULLY ASYNC: never block any thread. Write back in dispatch_group_notify
+    // so Metal's completion handler can fire on any queue without deadlock.
+    // (The previous dispatch_group_wait could deadlock when Metal's completion
+    //  ran on the same utility queue we were blocking → crash via watchdog.)
+    NSMutableSet  *pipeKeysCap  = [pipeKeys mutableCopy];
+    NSDictionary  *snapGenCap   = [snapGen copy];
+    NSNumber      *hashCap      = hash;
+    dispatch_group_notify(buildGroup,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 
-    // Write results back under lock.
-    // CRITICAL: before writing, check that the generation counter for each pKey hasn't
-    // changed. If it changed, hooked_newRenderPipelineState registered a NEW pipeline at
-    // that address (address reuse after scene transition). Our variant was built for the OLD
-    // pipeline descriptor — writing it would put a stale/incompatible variant in
-    // pipelinePatches, which crashes Metal when setRenderPipelineState: uses it.
-    NSUInteger descReleased = 0;
-    @synchronized(gHookLock) {
-        for (NSValue *pk in newPatches) {
-            if (![pipelineGeneration[pk] isEqual:snapGen[pk]]) continue; // address reused → skip
-            pipelinePatches[pk] = newPatches[pk];
-            // MTLRenderPipelineState compiled → descriptor is no longer needed for THIS pipeline.
-            // MTLRenderPipelineState is a self-contained GPU binary and does NOT retain the source
-            // MTLFunction objects after compilation. Releasing the descriptor copy here drops our
-            // only strong reference to the game's MTLFunction→MTLLibrary, allowing the OS to free
-            // those shader libraries when the game releases its own references (anti-Jetsam/OOM).
-            if (pipelineDescriptors[pk]) {
-                // Release only the descriptor (holds game's MTLFunction refs → anti-OOM).
-                // pipelineFragHash/VertHash are kept: hooked_setRenderPipelineState needs
-                // them for the colorOn/isFlash check on every draw call.
-                [pipelineDescriptors removeObjectForKey:pk];
-                descReleased++;
+        NSUInteger descReleased = 0;
+        @synchronized(gHookLock) {
+            for (NSValue *pk in newPatches) {
+                if (![pipelineGeneration[pk] isEqual:snapGenCap[pk]]) continue; // address reused
+                if (((NSDictionary *)newPatches[pk]).count > 0) {
+                    pipelinePatches[pk] = newPatches[pk];
+                } else {
+                    [pipelinePatches removeObjectForKey:pk]; // deactivated
+                }
+                if (pipelineDescriptors[pk]) {
+                    [pipelineDescriptors removeObjectForKey:pk]; // anti-OOM
+                    descReleased++;
+                }
+            }
+            // Remove patches for pKeys that had no build (fully deactivated, no libs)
+            for (NSValue *pk in pipeKeysCap) {
+                if (![pipelineGeneration[pk] isEqual:snapGenCap[pk]]) continue;
+                if (!newPatches[pk]) [pipelinePatches removeObjectForKey:pk];
             }
         }
-        for (NSValue *pk in pipeKeys) {
-            if (![pipelineGeneration[pk] isEqual:snapGen[pk]]) continue; // address reused → skip
-            if (!newPatches[pk]) [pipelinePatches removeObjectForKey:pk];
-        }
-    }
-    if (descReleased > 0)
-        fmLog([NSString stringWithFormat:@"[SYS] %lu descriptor rilasciati post-build (anti-OOM)", (unsigned long)descReleased]);
-
-    NSString *fmtsStr = seenFmts.count ? [seenFmts.allObjects componentsJoinedByString:@","] : @"?";
-    NSString *msg = [NSString stringWithFormat:
-        @"[REBUILD] hash=%04lx  pipe:%lu  color:%ld  flash:%ld  noDesc:%ld  fmt=%@",
-        (unsigned long)(hash.unsignedIntegerValue & 0xFFFF),
-        (unsigned long)pipeKeys.count, colorBuilt, flashBuilt, noDesc, fmtsStr];
-    dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:msg]; });
+        NSString *fmtsStr = seenFmts.count ? [seenFmts.allObjects componentsJoinedByString:@","] : @"?";
+        NSString *msg = [NSString stringWithFormat:
+            @"[REBUILD â] hash=%04lx pipe:%lu color:%ld flash:%ld noDesc:%ld fmt=%@",
+            (unsigned long)(hashCap.unsignedIntegerValue & 0xFFFF),
+            (unsigned long)pipeKeysCap.count, colorBuilt, flashBuilt, noDesc, fmtsStr];
+        dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:msg]; });
+    });
 }
 
 // ── Update patches for entry (called from UI on background queue) ─────────────
@@ -1165,17 +1162,29 @@ static void buildVariantPipelineAsync(id device,
             }
         }
     }
-    // Metal async API — internally safe during active render passes
-    origNewPipelineAsync(device,
-        @selector(newRenderPipelineStateWithDescriptor:completionHandler:),
-        d,
-        ^(id<MTLRenderPipelineState> ps, NSError *err) {
-            if (err) {
-                NSString *em = [NSString stringWithFormat:@"[ASYNC VAR ERR] %@", err.localizedDescription ?: @"nil"];
-                dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:em]; });
-            }
-            if (completion) completion(ps);
-        });
+    // Metal async API — safe during active render passes; use sync fallback if async not set.
+    if (origNewPipelineAsync) {
+        origNewPipelineAsync(device,
+            @selector(newRenderPipelineStateWithDescriptor:completionHandler:),
+            d,
+            ^(id<MTLRenderPipelineState> ps, NSError *err) {
+                if (err) {
+                    NSString *em = [NSString stringWithFormat:@"[ASYNC VAR ERR] %@", err.localizedDescription ?: @"nil"];
+                    dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:em]; });
+                }
+                if (completion) completion(ps);
+            });
+    } else {
+        // Fallback: sync build on caller's background queue (safe, just blocks a moment)
+        NSError *err2 = nil;
+        id<MTLRenderPipelineState> ps2 = origNewPipeline(device,
+            @selector(newRenderPipelineStateWithDescriptor:error:), d, &err2);
+        if (err2) {
+            NSString *em = [NSString stringWithFormat:@"[SYNC VAR ERR] %@", err2.localizedDescription ?: @"nil"];
+            dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:em]; });
+        }
+        if (completion) completion(ps2);
+    }
 }
 
 static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cmd,
