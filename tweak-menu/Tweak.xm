@@ -1688,8 +1688,7 @@ static void lc_init() {
     NSLog(@"[FM] lc_init start");
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     NSLog(@"[FM] bid=%@", bid);
-    if (![bid isEqualToString:@"com.gameinsight.gobios"] &&
-        ![bid isEqualToString:@"com.ubisoft.rainbowsixmobile.r6.fps.pvp.shooter"]) return;
+    // Bundle filter handled by .plist — no hardcoded check needed
 
     // ── Install crash diagnostics (before anything else) ──────────────────────
     {
