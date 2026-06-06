@@ -94,6 +94,7 @@ static const char kVertPatchKey    = 'V'; // on MTLRenderCommandEncoder → @YES
 typedef id<MTLLibrary>              (*LibIMP)(id,SEL,NSString*,MTLCompileOptions*,NSError**);
 typedef void                        (*LibAsyncIMP)(id,SEL,NSString*,MTLCompileOptions*,MTLNewLibraryCompletionHandler);
 typedef id<MTLLibrary>              (*LibDataIMP)(id,SEL,dispatch_data_t,NSError**);
+typedef id<MTLLibrary>              (*LibUrlIMP)(id,SEL,NSURL*,NSError**);
 typedef id<MTLFunction>             (*NewFuncIMP)(id,SEL,NSString*);
 // Specialization-constant variants — used by R6 Mobile for fragment functions
 typedef id<MTLFunction>             (*NewFuncConstIMP)(id,SEL,NSString*,MTLFunctionConstantValues*,NSError**);
@@ -109,6 +110,7 @@ typedef id                          (*ParallelEncIMP)(id,SEL,MTLRenderPassDescri
 static LibIMP       origNewLibrary      = NULL;
 static LibAsyncIMP  origNewLibraryAsync = NULL;
 static LibDataIMP   origNewLibraryData  = NULL;
+static LibUrlIMP     origNewLibraryUrl  = NULL;
 static NewFuncIMP          origNewFunction          = NULL;
 static NewFuncConstIMP     origNewFunctionConst     = NULL;
 static NewFuncConstAsyncIMP origNewFunctionConstAsync = NULL;
@@ -1488,6 +1490,67 @@ static id<MTLLibrary> hooked_newLibraryWithData(id self, SEL _cmd,
 // ── Hook: parallelRenderCommandEncoderWithDescriptor: ────────────────────────
 // Static C function replaces imp_implementationWithBlock (not reliable on LLVM clang)
 
+// ── Hook: newLibraryWithURL:error: (Unreal Engine loads pre-compiled .metallib via URL) ──
+static id<MTLLibrary>
+hooked_newLibraryWithURL(id self, SEL _cmd, NSURL *url, NSError **error) {
+    if (!gHooksEnabled) return origNewLibraryUrl(self, _cmd, url, error);
+    id<MTLLibrary> lib = origNewLibraryUrl(self, _cmd, url, error);
+    if (!lib) return lib;
+
+    NSArray<NSString *> *funcNames = [lib functionNames];
+    NSString *fileName = [url lastPathComponent] ?: @unknown.metallib;
+
+    NSMutableString *displaySrc = [NSMutableString string];
+    [displaySrc appendString:@"// ⚠️  METALLIB PRECOMPILATA (URL) — sorgente MSL non disponibile
+"];
+    [displaySrc appendFormat:@"// File: %@
+", fileName];
+    [displaySrc appendString:@"// I pulsanti R/G/B/⚡ non sono applicabili.
+"];
+    [displaySrc appendString:@"// Il pulsante V (wallhack) funziona via depth stencil override.
+//
+"];
+    [displaySrc appendString:@"// Funzioni contenute:
+"];
+    for (NSString *fn in funcNames) {
+        [displaySrc appendFormat:@"//   %@
+", fn];
+    }
+
+    // Stable hash from URL + function names
+    NSUInteger fakeHash = [url.absoluteString hash];
+    NSUInteger max = MIN(8, funcNames.count);
+    for (NSUInteger i = 0; i < max; i++)
+        fakeHash ^= ([funcNames[i] hash] >> i);
+    NSNumber *hKey = @(fakeHash);
+
+    @synchronized(gHookLock) {
+        if (!capturedLibraries[hKey]) {
+            capturedSources[hKey]   = displaySrc;
+            capturedLibraries[hKey] = lib;
+        }
+    }
+    objc_setAssociatedObject(lib, &kLibHashKey, hKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    static dispatch_once_t urlFuncHookOnce;
+    dispatch_once(&urlFuncHookOnce, ^{
+        Class cls = object_getClass(lib);
+        Method m  = class_getInstanceMethod(cls, @selector(newFunctionWithName:));
+        if (m && (!origNewFunction || method_getImplementation(m) != (IMP)hooked_newFunctionWithName)) {
+            origNewFunction = (NewFuncIMP)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_newFunctionWithName);
+        }
+        hookFuncConstMethods(lib);
+    });
+
+    NSString *dispName = funcNames.count > 0 ? funcNames.firstObject : fileName;
+    NSString *srcCopy  = [displaySrc copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (floatingMenu) [floatingMenu captureShaderWithName:dispName source:srcCopy error:nil];
+    });
+    return lib;
+}
+
 static id hooked_parallelRenderCommandEncoder(id self, SEL _cmd, MTLRenderPassDescriptor *d) {
     if (!gHooksEnabled) return origParallelEnc ? origParallelEnc(self, _cmd, d) : nil;
     if (!origParallelEnc) return nil;
@@ -1647,6 +1710,12 @@ static void installHooks(id<MTLDevice> device) {
         Method m = class_getInstanceMethod(dCls, @selector(newLibraryWithData:error:));
         if (m) { origNewLibraryData = (LibDataIMP)method_getImplementation(m);
                  method_setImplementation(m, (IMP)hooked_newLibraryWithData); }
+    }
+    // 1d. newLibraryWithURL:error: (Unreal Engine — loads pre-compiled .metallib from disk)
+    {
+        Method m = class_getInstanceMethod(dCls, @selector(newLibraryWithURL:error:));
+        if (m) { origNewLibraryUrl = (LibUrlIMP)method_getImplementation(m);
+                 method_setImplementation(m, (IMP)hooked_newLibraryWithURL); }
     }
     // 2a. newRenderPipelineStateWithDescriptor:error: (synchronous)
     {
