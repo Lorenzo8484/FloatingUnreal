@@ -1059,7 +1059,7 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
     if (!fHash && desc.fragmentFunction) {
         // _MTLFunctionInternal (used by Unity/R6) may not implement -library → guard
         id<MTLLibrary> fLib = [desc.fragmentFunction respondsToSelector:@selector(library)]
-            ? desc.fragmentFunction.library : nil;
+            ? ((id<MTLFunction_iOS14>)desc.fragmentFunction).library : nil;
         if (fLib) {
             NSNumber *libHash = objc_getAssociatedObject(fLib, &kLibHashKey);
             if (!libHash) {
@@ -1266,7 +1266,7 @@ static void hooked_newRenderPipelineStateAsync(id self, SEL _cmd,
                 // Fragment late-tag (async path) — same logic as sync hook
                 if (!fHash) {
                     id<MTLLibrary> fLib = [desc.fragmentFunction respondsToSelector:@selector(library)]
-                        ? desc.fragmentFunction.library : nil;
+                        ? ((id<MTLFunction_iOS14>)desc.fragmentFunction).library : nil;
                     if (fLib) {
                         NSNumber *libHash = objc_getAssociatedObject(fLib, &kLibHashKey);
                         if (!libHash) {
@@ -1490,7 +1490,7 @@ static id<MTLLibrary> hooked_newLibraryWithData(id self, SEL _cmd,
 // ── Hook: parallelRenderCommandEncoderWithDescriptor: ────────────────────────
 // Static C function replaces imp_implementationWithBlock (not reliable on LLVM clang)
 
-// ── Hook: newLibraryWithURL:error: (Unreal Engine loads pre-compiled .metallib via URL) ──
+// ── Hook: newLibraryWithURL:error: (Unreal Engine — pre-compiled .metallib) ──
 static id<MTLLibrary>
 hooked_newLibraryWithURL(id self, SEL _cmd, NSURL *url, NSError **error) {
     if (!gHooksEnabled) return origNewLibraryUrl(self, _cmd, url, error);
@@ -1498,36 +1498,33 @@ hooked_newLibraryWithURL(id self, SEL _cmd, NSURL *url, NSError **error) {
     if (!lib) return lib;
 
     NSArray<NSString *> *funcNames = [lib functionNames];
-    NSString *fileName = [url lastPathComponent] ?: @unknown.metallib;
+    NSString *fileName = [url lastPathComponent] ?: @"unknown.metallib";
 
     NSMutableString *displaySrc = [NSMutableString string];
-    [displaySrc appendString:@"// ⚠️  METALLIB PRECOMPILATA (URL) — sorgente MSL non disponibile
-"];
-    [displaySrc appendFormat:@"// File: %@
-", fileName];
-    [displaySrc appendString:@"// I pulsanti R/G/B/⚡ non sono applicabili.
-"];
-    [displaySrc appendString:@"// Il pulsante V (wallhack) funziona via depth stencil override.
-//
-"];
-    [displaySrc appendString:@"// Funzioni contenute:
-"];
+    [displaySrc appendString:@"// \xe2\x9a\xa0\xef\xb8\x8f  METALLIB PRECOMPILATA (URL)\n"];
+    [displaySrc appendFormat:@"// File: %@\n", fileName];
+    [displaySrc appendString:@"// R/G/B/flash non disponibili (binary shader).\n"];
+    [displaySrc appendString:@"// V (wallhack) funziona via depth stencil override.\n//\n"];
+    [displaySrc appendString:@"// Funzioni:\n"];
     for (NSString *fn in funcNames) {
-        [displaySrc appendFormat:@"//   %@
-", fn];
+        [displaySrc appendFormat:@"//   %@\n", fn];
     }
 
-    // Stable hash from URL + function names
     NSUInteger fakeHash = [url.absoluteString hash];
-    NSUInteger max = MIN(8, funcNames.count);
-    for (NSUInteger i = 0; i < max; i++)
+    NSUInteger maxF = MIN(8, funcNames.count);
+    for (NSUInteger i = 0; i < maxF; i++)
         fakeHash ^= ([funcNames[i] hash] >> i);
     NSNumber *hKey = @(fakeHash);
 
+    BOOL isNew = NO;
+    NSString *srcCopy = nil;
+    NSString *dispName = funcNames.count > 0 ? funcNames.firstObject : fileName;
     @synchronized(gHookLock) {
         if (!capturedLibraries[hKey]) {
             capturedSources[hKey]   = displaySrc;
             capturedLibraries[hKey] = lib;
+            isNew    = YES;
+            srcCopy  = [displaySrc copy];
         }
     }
     objc_setAssociatedObject(lib, &kLibHashKey, hKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1543,13 +1540,16 @@ hooked_newLibraryWithURL(id self, SEL _cmd, NSURL *url, NSError **error) {
         hookFuncConstMethods(lib);
     });
 
-    NSString *dispName = funcNames.count > 0 ? funcNames.firstObject : fileName;
-    NSString *srcCopy  = [displaySrc copy];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (floatingMenu) [floatingMenu captureShaderWithName:dispName source:srcCopy error:nil];
-    });
+    if (isNew) {
+        NSString *cap = srcCopy;
+        NSString *nm  = dispName;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (floatingMenu) [floatingMenu captureShaderWithName:nm source:cap error:nil];
+        });
+    }
     return lib;
 }
+
 
 static id hooked_parallelRenderCommandEncoder(id self, SEL _cmd, MTLRenderPassDescriptor *d) {
     if (!gHooksEnabled) return origParallelEnc ? origParallelEnc(self, _cmd, d) : nil;
@@ -1711,7 +1711,7 @@ static void installHooks(id<MTLDevice> device) {
         if (m) { origNewLibraryData = (LibDataIMP)method_getImplementation(m);
                  method_setImplementation(m, (IMP)hooked_newLibraryWithData); }
     }
-    // 1d. newLibraryWithURL:error: (Unreal Engine — loads pre-compiled .metallib from disk)
+    // 1d. newLibraryWithURL:error: (Unreal Engine loads .metallib from disk)
     {
         Method m = class_getInstanceMethod(dCls, @selector(newLibraryWithURL:error:));
         if (m) { origNewLibraryUrl = (LibUrlIMP)method_getImplementation(m);
