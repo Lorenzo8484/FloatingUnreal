@@ -2044,16 +2044,11 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
 
     [self.shaders addObject:entry];
 
-    NSString *q = [self.searchField.text stringByTrimmingCharactersInSet:
-                   [NSCharacterSet whitespaceCharacterSet]];
-    BOOL passTab    = (_currentTab == 0) || (_currentTab == 1 && entry.isSaved);
-    BOOL passSearch = (q.length == 0 ||
-                       [[entry.name lowercaseString] containsString:[q lowercaseString]] ||
-                       [[entry.displayName lowercaseString] containsString:[q lowercaseString]]);
-    if (passTab && passSearch) [self.filteredShaders addObject:entry];
-
+    // Rebuild filteredShaders via applyFilter so the smart filter is respected.
+    // (The old passSearch path only checked searchField and ignored smartField,
+    //  causing the badge to grow while the visible list stayed stale.)
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.shaderList reloadData]; [self updateCountBadge];
+        [self applyFilter];
     });
 }
 
