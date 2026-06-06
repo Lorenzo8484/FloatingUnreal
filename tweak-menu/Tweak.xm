@@ -342,8 +342,26 @@ static NSString *injectFragColor(NSString *src, float r, float g, float b) {
 
     // Direct in-place assignment on the existing return variable — no struct copy.
     // Works for both half4 and float4 SV_Target0 because (half) cast is explicit.
+    // If colorMember not found via [[color( attribute, try common UE/ANGLE output member names
+    // so we don't fall back to the broken scalar _fm_v.r path for struct return types.
+    if (!colorMember) {
+        NSArray *knownColorMembers = @[@"webgl_FragColor", @"webgl_fragcolor",
+                                       @"SV_Target0", @"sv_target0",
+                                       @"SV_Target",  @"sv_target",
+                                       @"out_Color",  @"out_color",
+                                       @"fragColor",  @"fragcolor"];
+        for (NSString *cm in knownColorMembers) {
+            // Only accept if it appears in the body (i.e. the return variable actually has it)
+            if ([body containsString:cm]) { colorMember = cm; break; }
+        }
+        if (colorMember)
+            fmLog([NSString stringWithFormat:@"[INJECT FRAG] colorMember found via name lookup: %@", colorMember]);
+    }
+
     NSString *repl;
     if (colorMember) {
+        // Direct member assignment — works for both float4 and half4 members.
+        // (half)→float promotion is valid in Metal MSL.
         repl = [NSString stringWithFormat:
             @"%@.%@.r=(half)%.4ff; %@.%@.g=(half)%.4ff; %@.%@.b=(half)%.4ff; %@.%@.a=1.0h; return %@;",
             origExpr, colorMember, r,
@@ -352,7 +370,8 @@ static NSString *injectFragColor(NSString *src, float r, float g, float b) {
             origExpr, colorMember,
             origExpr];
     } else {
-        // Also force alpha=1 so blend doesn't make output transparent
+        // Last-resort scalar path (works for shaders that return half4/float4 directly,
+        // NOT for struct returns — those will fail to compile and trigger FM_CONST_FRAG).
         repl = [NSString stringWithFormat:
             @"{ auto _fm_v=(%@); _fm_v.r=(half)%.4ff; _fm_v.g=(half)%.4ff; _fm_v.b=(half)%.4ff; _fm_v.a=1.0h; return _fm_v; }",
             origExpr, r, g, b];
@@ -611,10 +630,22 @@ static void applyPatchesForEntry(ShaderEntry *entry, MTLCompileOptions *opts) {
         if (injectWorked) {
             // Normal MSL inject succeeded — compile the modified source
             lib = compileDirect(src, origOpts);
-            NSString *status = lib ? @"OK ✓" : @"FAIL ✗";
-            NSString *logMsg = [NSString stringWithFormat:@"[COMPILE] %@ color=%@ flash=%d → %@",
-                entry.name, colorPatchName, (int)hasFlash, status];
-            dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:logMsg]; });
+            if (lib) {
+                NSString *logMsg = [NSString stringWithFormat:@"[COMPILE] %@ color=%@ → OK ✓", entry.name, colorPatchName];
+                dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:logMsg]; });
+            } else if (entry.patchFragColor != FragPatchNone) {
+                // MSL compile failed (UE shaders can be complex) — fall back to const-color replacement.
+                // This guarantees the patch is visible even when inject produces invalid MSL.
+                float r=0,g=0,b=0;
+                if (entry.patchShadeOverride) {
+                    r = entry.patchShadeR; g = entry.patchShadeG; b = entry.patchShadeB;
+                } else if (entry.patchFragColor==FragPatchRed)   { r=1.0f; }
+                else if   (entry.patchFragColor==FragPatchGreen) { g=0.9f; b=0.2f; }
+                else if   (entry.patchFragColor==FragPatchBlue)  { r=0.2f; g=0.5f; b=1.0f; }
+                lib = FM_CONST_FRAG(r, g, b, "fmColorPatch");
+                NSString *logMsg = [NSString stringWithFormat:@"[COMPILE] %@ color=%@ → FAIL, usando const-color", entry.name, colorPatchName];
+                dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:logMsg]; });
+            }
 
         } else if (entry.patchFragColor != FragPatchNone) {
             // Binary IR / non-MSL: inject failed for fragment color patch.
