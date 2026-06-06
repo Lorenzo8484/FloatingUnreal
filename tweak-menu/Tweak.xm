@@ -1778,11 +1778,13 @@ static void lc_init() {
         NSSetUncaughtExceptionHandler(fmExceptionHandler);
     }
 
-    // Use alloc/init instead of factory methods — avoids objc_retainAutoreleasedReturnValue
-    // (Apple clang vs LLVM clang generate different ARC code for autoreleased returns)
-    // Restore saved hook state before any Metal hook fires
+    // Start with hooks OFF — prevents crashes in UE's complex Metal init sequence.
+    // Hooks are enabled automatically 3s after the menu appears (see below).
+    // If the user had explicitly saved YES, we honour it immediately.
     BOOL savedHooks = [[NSUserDefaults standardUserDefaults] boolForKey:@"FMHooksEnabled"];
-    gHooksEnabled = savedHooks;
+    // Only start YES if the user explicitly saved YES (key exists AND is true).
+    // boolForKey: returns NO for missing keys, so first-launch always starts NO.
+    gHooksEnabled = savedHooks; // NO on first launch → safe startup
 
     gHookLock           = [[NSObject alloc] init];
     capturedSources     = [[NSMutableDictionary alloc] init];
@@ -1878,6 +1880,20 @@ static void lc_init() {
 
         [floatingMenu show];
         [floatingMenu addLog:@"[INFO] Menu attivato"];
+
+        // Auto-enable hooks 3s after UI is ready.
+        // Starting with hooks OFF prevents crashes during UE's Metal init.
+        // After 3s the game is in its render loop and hooks are safe.
+        if (!gHooksEnabled) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!gHooksEnabled) {
+                    gHooksEnabled = YES;
+                    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"FMHooksEnabled"];
+                    if (floatingMenu) [floatingMenu addLog:@"[INFO] Hook abilitati automaticamente — cattura shader attiva"];
+                }
+            });
+        }
     }];
     NSLog(@"[FM] lc_init done");
     } // @autoreleasepool
