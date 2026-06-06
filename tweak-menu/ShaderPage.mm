@@ -2008,27 +2008,31 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
     if (entry.hasFragmentFunction) entry.fragIndex = ++_fragCount;
     if (entry.hasVertexFunction)   entry.vertIndex = ++_vertCount;
 
-    // ── Output struct (vertex/fragment out) ──────────────────────────────
-    // Strategy:
-    //  1. Try fixed hints "mtl_vertexout" / "mtl_fragmentout"
-    //  2. If that fails, parse the return type from the MSL function signature
-    //     (e.g. "vertex SomeOtherOut main0(...)" → hint = "someotherout")
-    //  3. If still nil, try common UE fallback names
-    {
+    // ── Detect ANGLE shader (WebGL-Metal bridge, e.g. Bullet Echo) ──────────
+    // ANGLE shaders carry specific struct names: defaultUniforms + ANGLEUniformBlock.
+    // For these we show uniform structs in both columns (more useful for UE inspection).
+    BOOL isANGLE = [lower containsString:@"defaultuniforms"] || [lower containsString:@"angleuniformblock"];
+
+    if (isANGLE) {
+        // LEFT = defaultUniforms (per-draw uniforms), RIGHT = ANGLEUniformBlock (ANGLE internals)
+        entry.displayName    = fmStructName(source, @"defaultuniforms")   ?: @"struct defaultUniforms";
+        entry.subMembersText = fmStructBody(source, @"defaultuniforms");
+        entry.vglobalsName   = fmStructName(source, @"angleuniformblock") ?: @"struct ANGLEUniformBlock";
+        entry.vglobalsText   = fmStructBody(source, @"angleuniformblock");
+    } else {
+        // Standard UE / Unity mode: LEFT = vertex/fragment output struct, RIGHT = VGlobals
         NSString *primaryHint = entry.hasFragmentFunction ? @"mtl_fragmentout" : @"mtl_vertexout";
         NSString *structName  = fmStructName(source, primaryHint);
         NSString *structBody  = fmStructBody(source, primaryHint);
 
         if (!structBody) {
-            // Fallback A: extract return type from "vertex|fragment <ReturnType> <funcName>("
+            // Fallback A: parse return type from "vertex|fragment <ReturnType> <funcName>("
             NSString *funcKw  = entry.hasFragmentFunction ? @"fragment " : @"vertex ";
             NSRange   funcPos = [lower rangeOfString:funcKw];
             if (funcPos.location != NSNotFound) {
                 NSUInteger after = NSMaxRange(funcPos);
-                // skip leading whitespace
                 NSCharacterSet *ws2 = [NSCharacterSet whitespaceCharacterSet];
                 while (after < source.length && [ws2 characterIsMember:[source characterAtIndex:after]]) after++;
-                // read the return-type token (stops at whitespace, '<', '(', newline)
                 NSUInteger start = after;
                 while (after < source.length) {
                     unichar c = [source characterAtIndex:after];
@@ -2036,9 +2040,8 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
                     after++;
                 }
                 if (after > start) {
-                    NSString *retType  = [source substringWithRange:NSMakeRange(start, after - start)];
-                    NSString *retHint  = [retType lowercaseString];
-                    // Only use it if it doesn't look like a built-in void/half4/float4 etc.
+                    NSString *retType = [source substringWithRange:NSMakeRange(start, after - start)];
+                    NSString *retHint = [retType lowercaseString];
                     BOOL isBuiltin = [retHint hasPrefix:@"void"] || [retHint hasPrefix:@"float"]
                                   || [retHint hasPrefix:@"half"]  || [retHint hasPrefix:@"int"]
                                   || [retHint hasPrefix:@"uint"];
@@ -2050,9 +2053,7 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
                 }
             }
         }
-
         if (!structBody) {
-            // Fallback B: common alternative UE output struct name suffixes
             NSArray *altHints = entry.hasFragmentFunction
                 ? @[@"_mtl_fragmentout", @"main_out", @"main0_out", @"ps_out", @"fsoutput", @"fragout"]
                 : @[@"_mtl_vertexout",   @"main_out", @"main0_out", @"vs_out", @"vsoutput",  @"vertout"];
@@ -2062,52 +2063,37 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
                 if (b2) { structName = n2; structBody = b2; break; }
             }
         }
-
         entry.displayName    = structName ?: (entry.hasFragmentFunction ? @"struct Mtl_FragmentOut" : @"struct Mtl_VertexOut");
         entry.subMembersText = structBody;
-    }
 
-    // ── VGlobals / Uniform-buffer struct ─────────────────────────────────────
-    // Strategy (same layered fallback as output struct):
-    //  1. UE HLSLCC name   "vglobals_type"
-    //  2. SPIRV-Cross names "type_globals", "_globals", "spvdescriptorset0"
-    //  3. Scan function params for  constant <Type>& ...  [[buffer(0)]]
-    //  4. Any remaining struct containing "globals" or "ubuffer" or "cbuffer" in its name
-    {
-        NSString *vgName = nil;
-        NSString *vgBody = nil;
-
-        // Pass 1: fixed hints
+        // RIGHT column: VGlobals / uniform-buffer struct
+        // Hints: UE HLSLCC "vglobals_type" -> SPIRV-Cross "type_globals"/"_globals" ->
+        //        "constant <Type>&" param scan
+        NSString *vgName = nil, *vgBody = nil;
         NSArray *vgHints = @[@"vglobals_type", @"type_globals", @"_globals",
-                             @"spvdescriptorset0", @"uniforms", @"cbuffer",
-                             @"ubuffer", @"pushconstants"];
+                             @"spvdescriptorset0", @"uniforms", @"cbuffer", @"ubuffer", @"pushconstants"];
         for (NSString *h in vgHints) {
             NSString *n2 = fmStructName(source, h);
             NSString *b2 = fmStructBody(source, h);
             if (b2) { vgName = n2; vgBody = b2; break; }
         }
-
-        // Pass 2: parse "constant <StructType>& " from function parameter list
         if (!vgBody) {
+            // Scan "constant <Type>&" params
             NSRegularExpression *re = [NSRegularExpression
                 regularExpressionWithPattern:@"constant\s+(\w+)\s*&"
                 options:NSRegularExpressionCaseInsensitive error:nil];
-            NSArray *matches = [re matchesInString:source options:0
-                                range:NSMakeRange(0, source.length)];
-            for (NSTextCheckingResult *m in matches) {
+            for (NSTextCheckingResult *m in [re matchesInString:source options:0
+                                             range:NSMakeRange(0, source.length)]) {
                 if (m.numberOfRanges < 2) continue;
-                NSString *typeName = [source substringWithRange:[m rangeAtIndex:1]];
-                NSString *typeHint = [typeName lowercaseString];
-                // Skip the output struct type we already found
-                if ([typeHint containsString:@"out"] || [typeHint containsString:@"in"]) continue;
-                NSString *n2 = fmStructName(source, typeHint);
-                NSString *b2 = fmStructBody(source, typeHint);
+                NSString *th = [[source substringWithRange:[m rangeAtIndex:1]] lowercaseString];
+                if ([th containsString:@"out"] || [th containsString:@"_in"]) continue;
+                NSString *n2 = fmStructName(source, th);
+                NSString *b2 = fmStructBody(source, th);
                 if (b2 && b2.length > 4) { vgName = n2; vgBody = b2; break; }
             }
         }
-
         entry.vglobalsName = vgName ?: @"struct VGlobals_Type";
-        entry.vglobalsText = vgBody; // nil = no VGlobals column shown
+        entry.vglobalsText = vgBody;
     }
 
     // ── Restore saved patch state (persists across game restarts) ──────────────
