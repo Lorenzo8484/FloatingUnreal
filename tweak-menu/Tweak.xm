@@ -59,6 +59,7 @@ static BOOL          menuInstalled = NO;
 // ── Patch state ───────────────────────────────────────────────────────────────
 
 static id<MTLDevice>       hookedDevice         = nil;
+static NSMutableSet       *gBuiltVariantPairs  = nil; // "fHash|vHash" — dedup in-match burst
 static NSMutableDictionary *capturedSources     = nil; // @(hash) → NSString
 static NSMutableDictionary *capturedLibraries   = nil; // @(hash) → id<MTLLibrary>
 static NSMutableDictionary *capturedOptions     = nil; // @(hash) → MTLCompileOptions
@@ -568,9 +569,10 @@ static void rebuildVariantsForHash(NSNumber *hash) {
             // only strong reference to the game's MTLFunction→MTLLibrary, allowing the OS to free
             // those shader libraries when the game releases its own references (anti-Jetsam/OOM).
             if (pipelineDescriptors[pk]) {
+                // Release only the descriptor (holds game's MTLFunction refs → anti-OOM).
+                // pipelineFragHash/VertHash are kept: hooked_setRenderPipelineState needs
+                // them for the colorOn/isFlash check on every draw call.
                 [pipelineDescriptors removeObjectForKey:pk];
-                [pipelineVertHash    removeObjectForKey:pk];
-                [pipelineFragHash    removeObjectForKey:pk];
                 descReleased++;
             }
         }
@@ -731,6 +733,9 @@ static void applyPatchesForEntry(ShaderEntry *entry, MTLCompileOptions *opts) {
     }
 
     // Rebuild all existing pipelines that reference this shader — real-time effect
+    // Reset variant-dedup so hooked_newRenderPipelineState will build a fresh
+    // variant for new pipelines created after this patch change.
+    @synchronized(gBuiltVariantPairs) { [gBuiltVariantPairs removeAllObjects]; }
     rebuildVariantsForHash(hashKey);
 }
 
@@ -1235,14 +1240,32 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
         if (fHash && [flashHashes containsObject:fHash]) flLib = flashLibraries[fHash];
     }
 
+    // Dedup: if a variant for this (fHash,vHash) pair already exists (built during
+    // the same match-load burst), skip building another one — prevents OOM from
+    // creating 50+ identical GPU-compiled pipeline objects for the same shader.
+    // The existing variant in pipelinePatches will be picked up by setRenderPipelineState
+    // via the pipelineFragHash/VertHash entries that now persist after descriptor release.
+    NSString *pairKey = [NSString stringWithFormat:@"%@|%@",
+        fHash ? [NSString stringWithFormat:@"%lx", fHash.unsignedIntegerValue] : @"0",
+        vHash ? [NSString stringWithFormat:@"%lx", vHash.unsignedIntegerValue] : @"0"];
+    BOOL alreadyBuilt = NO;
+    @synchronized(gBuiltVariantPairs) { alreadyBuilt = [gBuiltVariantPairs containsObject:pairKey]; }
+
     NSMutableDictionary *variants = [NSMutableDictionary dictionary];
-    if (colorNow && (cvLib || cfLib)) {
-        id<MTLRenderPipelineState> cp = buildVariantPipeline(self, desc, cvLib, cfLib);
-        if (cp) variants[@"color"] = cp;
-    }
-    if (flLib) {
-        id<MTLRenderPipelineState> fp = buildVariantPipeline(self, desc, nil, flLib);
-        if (fp) variants[@"flash"] = fp;
+    if (!alreadyBuilt) {
+        if (colorNow && (cvLib || cfLib)) {
+            id<MTLRenderPipelineState> cp = buildVariantPipeline(self, desc, cvLib, cfLib);
+            if (cp) variants[@"color"] = cp;
+        }
+        if (flLib) {
+            id<MTLRenderPipelineState> fp = buildVariantPipeline(self, desc, nil, flLib);
+            if (fp) variants[@"flash"] = fp;
+        }
+        if (variants.count > 0) {
+            @synchronized(gBuiltVariantPairs) { [gBuiltVariantPairs addObject:pairKey]; }
+        }
+    } else {
+        fmLog([NSString stringWithFormat:@"[PIPE NEW] skip variant build (già costruita per %@) — anti-OOM", pairKey]);
     }
 
     if (variants.count > 0) {
@@ -1257,9 +1280,9 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
                 pipelinePatches[pKey] = variants;
                 // Descriptor no longer needed — release immediately to free game's
                 // MTLFunction→MTLLibrary references (anti-Jetsam/OOM).
+                // Release descriptor (anti-OOM). pipelineFragHash/VertHash stay:
+                // hooked_setRenderPipelineState needs them for colorOn check.
                 [pipelineDescriptors removeObjectForKey:pKey];
-                [pipelineVertHash    removeObjectForKey:pKey];
-                [pipelineFragHash    removeObjectForKey:pKey];
                 written = YES;
             }
         }
@@ -1672,6 +1695,7 @@ void fmClearAllShaderPatches(void) {
         [pipelineGeneration removeAllObjects]; // invalidate any in-flight rebuildVariantsForHash
         [colorLibraries     removeAllObjects]; // release stale MTLLibrary objects
         [flashLibraries     removeAllObjects];
+        @synchronized(gBuiltVariantPairs) { [gBuiltVariantPairs removeAllObjects]; }
         // Also purge descriptor/hash tables: entries whose addresses are now stale
         // hold strong refs to MTLFunction/MTLLibrary objects and waste memory.
         [pipelineDescriptors removeAllObjects];
@@ -1840,6 +1864,7 @@ static void lc_init() {
     flashHashes         = [[NSMutableSet alloc] init];
     activeColorHashes   = [[NSMutableSet alloc] init];
     gLiveActiveHashes   = [[NSMutableSet alloc] init];
+    gBuiltVariantPairs  = [[NSMutableSet alloc] init];
     NSLog(@"[FM] dizionari inizializzati");
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
