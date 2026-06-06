@@ -1447,22 +1447,25 @@ static id<MTLLibrary> hooked_newLibraryWithData(id self, SEL _cmd,
     NSArray<NSString *> *funcNames = [lib functionNames];
     if (funcNames.count == 0) return lib;
 
-    // Build a readable display source listing all contained function names
-    NSMutableString *displaySrc = [NSMutableString string];
-    [displaySrc appendString:@"// ⚠️  METALLIB PRECOMPILATA — sorgente MSL non disponibile\n"];
-    [displaySrc appendString:@"// I pulsanti R/G/B/⚡ non sono applicabili.\n"];
-    [displaySrc appendString:@"// Il pulsante V (wallhack) funziona via depth stencil override.\n//\n"];
-    [displaySrc appendString:@"// Funzioni contenute:\n"];
-    for (NSString *fn in funcNames) {
-        [displaySrc appendFormat:@"//   %@\n", fn];
-    }
-
     // Stable hash: mix data size + XOR of first few function-name hashes
     NSUInteger fakeHash = dispatch_data_get_size(data);
     NSUInteger max = MIN(8, funcNames.count);
     for (NSUInteger i = 0; i < max; i++)
         fakeHash ^= ([funcNames[i] hash] >> i);
     NSNumber *hKey = @(fakeHash);
+    NSUInteger h16 = fakeHash & 0xFFFF;
+
+    // Build a readable display source listing all contained function names
+    // Hash is embedded so each metallib gets a unique stableKey in ShaderPage
+    NSMutableString *displaySrc = [NSMutableString string];
+    [displaySrc appendString:@"// ⚠️  METALLIB PRECOMPILATA — sorgente MSL non disponibile\n"];
+    [displaySrc appendString:@"// I pulsanti R/G/B/⚡ non sono applicabili.\n"];
+    [displaySrc appendString:@"// Il pulsante V (wallhack) funziona via depth stencil override.\n//\n"];
+    [displaySrc appendFormat:@"// ID libreria: %04lx\n//\n", (unsigned long)h16];
+    [displaySrc appendString:@"// Funzioni contenute:\n"];
+    for (NSString *fn in funcNames) {
+        [displaySrc appendFormat:@"//   %@\n", fn];
+    }
 
     @synchronized(gHookLock) {
         capturedSources[hKey]   = displaySrc;
@@ -1481,7 +1484,9 @@ static id<MTLLibrary> hooked_newLibraryWithData(id self, SEL _cmd,
         hookFuncConstMethods(lib);
     });
 
-    NSString *dispName = funcNames.firstObject ?: @"binary_lib";
+    // dispName includes h16 so each binary metallib gets its own entry (not deduped)
+    NSString *firstName = funcNames.firstObject ?: @"binary_lib";
+    NSString *dispName  = [NSString stringWithFormat:@"%@ [%04lx]", firstName, (unsigned long)h16];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (floatingMenu) [floatingMenu captureShaderWithName:dispName source:displaySrc error:nil];
     });
@@ -1501,9 +1506,17 @@ hooked_newLibraryWithURL(id self, SEL _cmd, NSURL *url, NSError **error) {
     NSArray<NSString *> *funcNames = [lib functionNames];
     NSString *fileName = [url lastPathComponent] ?: @"unknown.metallib";
 
+    NSUInteger fakeHash = [url.absoluteString hash];
+    NSUInteger maxF = MIN(8, funcNames.count);
+    for (NSUInteger i = 0; i < maxF; i++)
+        fakeHash ^= ([funcNames[i] hash] >> i);
+    NSNumber *hKey = @(fakeHash);
+    NSUInteger h16url = fakeHash & 0xFFFF;
+
     NSMutableString *displaySrc = [NSMutableString string];
     [displaySrc appendString:@"// \xe2\x9a\xa0\xef\xb8\x8f  METALLIB PRECOMPILATA (URL)\n"];
     [displaySrc appendFormat:@"// File: %@\n", fileName];
+    [displaySrc appendFormat:@"// ID libreria: %04lx\n", (unsigned long)h16url];
     [displaySrc appendString:@"// R/G/B/flash non disponibili (binary shader).\n"];
     [displaySrc appendString:@"// V (wallhack) funziona via depth stencil override.\n//\n"];
     [displaySrc appendString:@"// Funzioni:\n"];
@@ -1511,15 +1524,10 @@ hooked_newLibraryWithURL(id self, SEL _cmd, NSURL *url, NSError **error) {
         [displaySrc appendFormat:@"//   %@\n", fn];
     }
 
-    NSUInteger fakeHash = [url.absoluteString hash];
-    NSUInteger maxF = MIN(8, funcNames.count);
-    for (NSUInteger i = 0; i < maxF; i++)
-        fakeHash ^= ([funcNames[i] hash] >> i);
-    NSNumber *hKey = @(fakeHash);
-
     BOOL isNew = NO;
     NSString *srcCopy = nil;
-    NSString *dispName = funcNames.count > 0 ? funcNames.firstObject : fileName;
+    NSString *firstNameUrl = funcNames.count > 0 ? funcNames.firstObject : fileName;
+    NSString *dispName = [NSString stringWithFormat:@"%@ [%04lx]", firstNameUrl, (unsigned long)h16url];
     @synchronized(gHookLock) {
         if (!capturedLibraries[hKey]) {
             capturedSources[hKey]   = displaySrc;
