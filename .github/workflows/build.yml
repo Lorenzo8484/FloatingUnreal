@@ -1,0 +1,56 @@
+name: Build FloatingUnreal
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ldid xz dpkg
+
+      - name: Setup Theos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export THEOS=/opt/theos
+          sudo mkdir -p $THEOS
+          sudo chown $USER $THEOS
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+
+          RELEASE_JSON=$(curl -fsSL -H "Authorization: token $GH_TOKEN" \
+            https://api.github.com/repos/theos/sdks/releases/latest)
+          SDK_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | grep 'iPhoneOS' | head -1 | cut -d'"' -f4)
+          curl -fsSL -H "Authorization: token $GH_TOKEN" -L -o sdk.tar.xz "$SDK_URL"
+          mkdir -p $THEOS/sdks
+          tar -xf sdk.tar.xz -C $THEOS/sdks
+          echo "THEOS=/opt/theos" >> $GITHUB_ENV
+
+      - name: Build
+        run: make package FINALPACKAGE=1
+
+      - name: Extract dylib from deb
+        run: |
+          mkdir -p dist
+          DEB=$(find packages -name "*.deb" | head -1)
+          cd dist
+          ar x "../$DEB"
+          for fmt in xz gz lzma zst; do
+            [ -f data.tar.$fmt ] && tar -xf data.tar.$fmt && break
+          done
+          DYLIB=$(find . -name "*.dylib" | head -1)
+          cp "$DYLIB" FloatingUnreal.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: FloatingUnreal
+          path: dist/FloatingUnreal.dylib
+          retention-days: 7
