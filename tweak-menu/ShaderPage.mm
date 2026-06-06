@@ -1351,8 +1351,9 @@ static NSString * const kPatchDefaultsKey = @"FMSavedPatches_v3";
 // Avoids using [source hash] (per-process salted on iOS) or full-source DJB2
 // (breaks if Unity changes even one embedded constant between sessions).
 static NSString *fmStableKey(NSString *name, NSString *source) {
-    return [NSString stringWithFormat:@"%@_%lu", name ?: @"unnamed",
-            (unsigned long)(source ?: @"").length];
+    // Use content hash (not length) — UE shaders have same name AND same length → dedup
+    NSUInteger h = [(source ?: @"") hash];
+    return [NSString stringWithFormat:@"%@_%lx", name ?: @"unnamed", (unsigned long)h];
 }
 
 - (void)_loadPatchCache {
