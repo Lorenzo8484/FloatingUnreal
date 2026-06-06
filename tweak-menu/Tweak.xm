@@ -60,6 +60,7 @@ static BOOL          menuInstalled = NO;
 
 static id<MTLDevice>       hookedDevice         = nil;
 static NSMutableSet       *gBuiltVariantPairs  = nil; // "fHash|vHash" — dedup in-match burst
+static _Atomic(uint64_t)   gPatchBuildGen       = 0;  // increments on clear → cancels in-flight async builds
 static NSMutableDictionary *capturedSources     = nil; // @(hash) → NSString
 static NSMutableDictionary *capturedLibraries   = nil; // @(hash) → id<MTLLibrary>
 static NSMutableDictionary *capturedOptions     = nil; // @(hash) → MTLCompileOptions
@@ -1240,66 +1241,104 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
         if (fHash && [flashHashes containsObject:fHash]) flLib = flashLibraries[fHash];
     }
 
-    // Dedup: if a variant for this (fHash,vHash) pair already exists (built during
-    // the same match-load burst), skip building another one — prevents OOM from
-    // creating 50+ identical GPU-compiled pipeline objects for the same shader.
-    // The existing variant in pipelinePatches will be picked up by setRenderPipelineState
-    // via the pipelineFragHash/VertHash entries that now persist after descriptor release.
+    // ── Skip depth-only / shadow / compute passes ──────────────────────────────
+    // These have no color attachments → fragment color patch is useless AND
+    // building a variant for them causes Metal pipeline validation crashes.
+    {
+        BOOL hasColorOut = NO;
+        for (NSUInteger i = 0; i < 8; i++) {
+            if (desc.colorAttachments[i].pixelFormat != MTLPixelFormatInvalid) {
+                hasColorOut = YES; break;
+            }
+        }
+        if (!hasColorOut) return orig;
+    }
+
+    // ── Dedup: one async-build per (fHash,vHash) pair ───────────────────────
+    // Prevents 50+ GPU pipeline compiles for the same shader during match load.
     NSString *pairKey = [NSString stringWithFormat:@"%@|%@",
         fHash ? [NSString stringWithFormat:@"%lx", fHash.unsignedIntegerValue] : @"0",
         vHash ? [NSString stringWithFormat:@"%lx", vHash.unsignedIntegerValue] : @"0"];
-    BOOL alreadyBuilt = NO;
-    @synchronized(gBuiltVariantPairs) { alreadyBuilt = [gBuiltVariantPairs containsObject:pairKey]; }
-
-    NSMutableDictionary *variants = [NSMutableDictionary dictionary];
-    if (!alreadyBuilt) {
-        if (colorNow && (cvLib || cfLib)) {
-            id<MTLRenderPipelineState> cp = buildVariantPipeline(self, desc, cvLib, cfLib);
-            if (cp) variants[@"color"] = cp;
+    {
+        BOOL alreadyQueued = NO;
+        @synchronized(gBuiltVariantPairs) {
+            alreadyQueued = [gBuiltVariantPairs containsObject:pairKey];
+            if (!alreadyQueued) [gBuiltVariantPairs addObject:pairKey];
         }
-        if (flLib) {
-            id<MTLRenderPipelineState> fp = buildVariantPipeline(self, desc, nil, flLib);
-            if (fp) variants[@"flash"] = fp;
+        if (alreadyQueued) {
+            fmLog([NSString stringWithFormat:@"[PIPE NEW] già in coda %@, skip", pairKey]);
+            return orig;
         }
-        if (variants.count > 0) {
-            @synchronized(gBuiltVariantPairs) { [gBuiltVariantPairs addObject:pairKey]; }
-        }
-    } else {
-        fmLog([NSString stringWithFormat:@"[PIPE NEW] skip variant build (già costruita per %@) — anti-OOM", pairKey]);
     }
 
-    if (variants.count > 0) {
-        // CRITICAL: only write back if the address hasn't been reused since we registered.
-        // During scene transitions the game releases pipelines from one thread and creates
-        // new ones (at the same addresses) from another thread while GPU compile is running.
-        // Without this check we'd store a variant built for descriptor A under address X
-        // which now belongs to descriptor B → setRenderPipelineState crashes Metal.
-        BOOL written = NO;
-        @synchronized(gHookLock) {
-            if ([pipelineGeneration[pKey] unsignedIntegerValue] == capturedGen) {
-                pipelinePatches[pKey] = variants;
-                // Descriptor no longer needed — release immediately to free game's
-                // MTLFunction→MTLLibrary references (anti-Jetsam/OOM).
-                // Release descriptor (anti-OOM). pipelineFragHash/VertHash stay:
-                // hooked_setRenderPipelineState needs them for colorOn check.
-                [pipelineDescriptors removeObjectForKey:pKey];
-                written = YES;
+    // ── ASYNC DELAYED BUILD — THE CORE CRASH FIX ─────────────────────────────
+    // Building the variant SYNCHRONOUSLY inside hooked_newRenderPipelineState
+    // crashes immediately when the shader first loads in-match:
+    //   game thread creates pipeline → our hook builds + swaps variant immediately
+    //   → Metal sees pipeline/renderpass mismatch (depth format, sample count,
+    //     blend equations not yet finalized) → EXC_BAD_ACCESS / Metal assert.
+    //
+    // The 500 ms delay gives the game's render pass time to fully stabilize
+    // before we install the variant. The game runs with the original pipeline
+    // for those first 500 ms (no patch visible yet, but no crash either).
+    //
+    // gPatchBuildGen: incremented by fmClearAllShaderPatches() / kill-switch.
+    // Any async build that finds gPatchBuildGen changed aborts before writing
+    // to pipelinePatches — making the kill switch truly instant even for
+    // in-flight builds.
+    {
+        id selfDevice              = self;
+        MTLRenderPipelineDescriptor *descCopy = [desc copy]; // snapshot before game mutates
+        uint64_t  genAtCapture     = gPatchBuildGen;
+        NSValue  *pKeyCopy         = pKey;
+        NSNumber *fHashCopy        = fHash;
+        NSNumber *vHashCopy        = vHash;
+        NSUInteger capturedGenCopy = capturedGen;
+        id<MTLLibrary> cvLibCopy   = cvLib;
+        id<MTLLibrary> cfLibCopy   = cfLib;
+        id<MTLLibrary> flLibCopy   = flLib;
+        BOOL colorNowCopy          = colorNow;
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+
+            // Abort if kill switch fired while waiting
+            if (gPatchBuildGen != genAtCapture) {
+                fmLog([NSString stringWithFormat:@"[ASYNC BUILD] annullato (kill) %@", pairKey]);
+                return;
             }
-        }
-        if (written) {
-            NSString *varMsg = [NSString stringWithFormat:
-                @"[PIPE NEW] variante creata: color:%d flash:%d — hash frag=%04lx vert=%04lx",
-                variants[@"color"] != nil, variants[@"flash"] != nil,
-                (unsigned long)(fHash ? fHash.unsignedIntegerValue & 0xFFFF : 0),
-                (unsigned long)(vHash ? vHash.unsignedIntegerValue & 0xFFFF : 0)];
-            dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:varMsg]; });
-        } else {
-            fmLog([NSString stringWithFormat:
-                @"[PIPE NEW] variante SCARTATA (address reuse) frag=%04lx vert=%04lx gen=%lu",
-                (unsigned long)(fHash ? fHash.unsignedIntegerValue & 0xFFFF : 0),
-                (unsigned long)(vHash ? vHash.unsignedIntegerValue & 0xFFFF : 0),
-                (unsigned long)capturedGen]);
-        }
+
+            NSMutableDictionary *variants = [NSMutableDictionary dictionary];
+            if (colorNowCopy && (cvLibCopy || cfLibCopy)) {
+                id<MTLRenderPipelineState> cp = buildVariantPipeline(selfDevice, descCopy, cvLibCopy, cfLibCopy);
+                if (cp) variants[@"color"] = cp;
+            }
+            if (flLibCopy) {
+                id<MTLRenderPipelineState> fp = buildVariantPipeline(selfDevice, descCopy, nil, flLibCopy);
+                if (fp) variants[@"flash"] = fp;
+            }
+            if (variants.count == 0) return;
+
+            // Final cancellation + address-reuse guard before writing
+            if (gPatchBuildGen != genAtCapture) return;
+            BOOL written = NO;
+            @synchronized(gHookLock) {
+                if (gPatchBuildGen == genAtCapture &&
+                    [pipelineGeneration[pKeyCopy] unsignedIntegerValue] == capturedGenCopy) {
+                    pipelinePatches[pKeyCopy] = variants;
+                    [pipelineDescriptors removeObjectForKey:pKeyCopy]; // anti-OOM
+                    written = YES;
+                }
+            }
+            if (written) {
+                NSString *msg = [NSString stringWithFormat:
+                    @"[ASYNC BUILD â] color:%d flash:%d frag=%04lx vert=%04lx",
+                    variants[@"color"]!=nil, variants[@"flash"]!=nil,
+                    (unsigned long)(fHashCopy ? fHashCopy.unsignedIntegerValue & 0xFFFF : 0),
+                    (unsigned long)(vHashCopy ? vHashCopy.unsignedIntegerValue & 0xFFFF : 0)];
+                dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:msg]; });
+            }
+        });
     }
     return orig;
 }
@@ -1696,6 +1735,7 @@ void fmClearAllShaderPatches(void) {
         [colorLibraries     removeAllObjects]; // release stale MTLLibrary objects
         [flashLibraries     removeAllObjects];
         @synchronized(gBuiltVariantPairs) { [gBuiltVariantPairs removeAllObjects]; }
+        gPatchBuildGen++; // cancel all in-flight async variant builds
         // Also purge descriptor/hash tables: entries whose addresses are now stale
         // hold strong refs to MTLFunction/MTLLibrary objects and waste memory.
         [pipelineDescriptors removeAllObjects];
