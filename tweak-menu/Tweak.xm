@@ -466,6 +466,12 @@ static id<MTLRenderPipelineState> buildVariantPipeline(id device,
                                                         MTLRenderPipelineDescriptor *base,
                                                         id<MTLLibrary> vLib,
                                                         id<MTLLibrary> fLib);
+typedef void (^FMPipelineCompletion)(id<MTLRenderPipelineState> _Nullable ps);
+static void buildVariantPipelineAsync(id device,
+                                       MTLRenderPipelineDescriptor *base,
+                                       id<MTLLibrary> vLib,
+                                       id<MTLLibrary> fLib,
+                                       FMPipelineCompletion completion);
 
 // ── Rebuild all variant pipelines that reference a given source hash ──────────
 // Called after colorLibraries/flashLibraries or activeColorHashes/flashHashes change
@@ -510,48 +516,84 @@ static void rebuildVariantsForHash(NSNumber *hash) {
         }];
     }
 
-    NSInteger colorBuilt = 0, flashBuilt = 0, noDesc = 0;
+    __block NSInteger colorBuilt = 0, flashBuilt = 0, noDesc = 0;
     NSMutableDictionary *newPatches = [NSMutableDictionary dictionary];
-    NSMutableSet *seenFmts = [NSMutableSet set]; // collect render-target formats for log
+    NSMutableSet *seenFmts = [NSMutableSet set];
+    // Use dispatch_group so we can wait for all async Metal compiles before
+    // writing results back under gHookLock.
+    dispatch_group_t buildGroup = dispatch_group_create();
+    NSObject *patchesLock = [[NSObject alloc] init]; // serialises newPatches writes
 
     for (NSValue *pk in pipeKeys) {
         MTLRenderPipelineDescriptor *desc = snapDesc[pk];
         if (!desc) { noDesc++; continue; }
-        // Collect color attachment format for diagnostics
         MTLPixelFormat pf = desc.colorAttachments[0].pixelFormat;
         [seenFmts addObject:fmFmtName(pf)];
 
         NSNumber *fh = snapFH[pk];
         NSNumber *vh = snapVH[pk];
-        NSMutableDictionary *variants = snapVariants[pk] ?: [NSMutableDictionary dictionary];
+        NSMutableDictionary *existingVars = snapVariants[pk] ?: [NSMutableDictionary dictionary];
 
+        // We collect removals synchronously; builds happen asynchronously.
         BOOL colorActive = (fh && [snapColorHashes containsObject:fh]) ||
                            (vh && [snapColorHashes containsObject:vh]);
+        BOOL flashActive = fh && [snapFlashHashes containsObject:fh];
+
+        // Prepare a mutable variants dict that will be populated by async completions
+        NSValue *pkCap = pk;
+        NSNumber *fhCap = fh, *vhCap = vh;
+
+        // Always start with any already-built variants; remove deactivated ones
+        NSMutableDictionary *pendingVars = [existingVars mutableCopy];
+        if (!colorActive) [pendingVars removeObjectForKey:@"color"];
+        if (!flashActive) [pendingVars removeObjectForKey:@"flash"];
+
         if (colorActive) {
             id<MTLLibrary> cvLib = vh ? snapColorLibV[vh] : nil;
             id<MTLLibrary> cfLib = fh ? snapColorLibF[fh] : nil;
             if (cvLib || cfLib) {
-                id<MTLRenderPipelineState> cp = buildVariantPipeline(hookedDevice, desc, cvLib, cfLib);
-                if (cp) { variants[@"color"] = cp; colorBuilt++; }
+                dispatch_group_enter(buildGroup);
+                buildVariantPipelineAsync(hookedDevice, desc, cvLib, cfLib, ^(id<MTLRenderPipelineState> cp) {
+                    if (cp) {
+                        @synchronized(patchesLock) {
+                            NSMutableDictionary *pv = newPatches[pkCap] ?: [NSMutableDictionary dictionary];
+                            [pv addEntriesFromDictionary:pendingVars];
+                            pv[@"color"] = cp;
+                            newPatches[pkCap] = pv;
+                            colorBuilt++;
+                        }
+                    }
+                    dispatch_group_leave(buildGroup);
+                });
             }
-        } else {
-            [variants removeObjectForKey:@"color"];
         }
-
-        if (fh && [snapFlashHashes containsObject:fh]) {
+        if (flashActive) {
             id<MTLLibrary> flLib = snapFlashLib[fh];
             if (flLib) {
-                id<MTLRenderPipelineState> fp = buildVariantPipeline(hookedDevice, desc, nil, flLib);
-                if (fp) { variants[@"flash"] = fp; flashBuilt++; }
+                dispatch_group_enter(buildGroup);
+                buildVariantPipelineAsync(hookedDevice, desc, nil, flLib, ^(id<MTLRenderPipelineState> fp) {
+                    if (fp) {
+                        @synchronized(patchesLock) {
+                            NSMutableDictionary *pv = newPatches[pkCap] ?: [NSMutableDictionary dictionary];
+                            [pv addEntriesFromDictionary:pendingVars];
+                            pv[@"flash"] = fp;
+                            newPatches[pkCap] = pv;
+                            flashBuilt++;
+                        }
+                    }
+                    dispatch_group_leave(buildGroup);
+                });
             }
-        } else {
-            [variants removeObjectForKey:@"flash"];
         }
-        if (variants.count > 0) {
-            newPatches[pk] = variants;
+        // If only deactivating (no active libs), still record the cleared entry
+        if (!colorActive && !flashActive && pendingVars.count == 0 && existingVars.count > 0) {
+            // signal removal: write empty dict (handled below when count==0)
+            @synchronized(patchesLock) { newPatches[pk] = [NSMutableDictionary dictionary]; }
         }
-        // keys NOT added to newPatches → variants were cleared → must be removed
     }
+    // Wait for all async Metal compiles — this blocks the background utility queue,
+    // not the game's render thread.
+    dispatch_group_wait(buildGroup, DISPATCH_TIME_FOREVER);
 
     // Write results back under lock.
     // CRITICAL: before writing, check that the generation counter for each pKey hasn't
@@ -1079,6 +1121,63 @@ static id<MTLRenderPipelineState> buildVariantPipeline(id device,
     return ps;
 }
 
+// ── buildVariantPipelineAsync ─────────────────────────────────────────────
+// Like buildVariantPipeline but uses Metal's OWN async compilation API
+// (newRenderPipelineStateWithDescriptor:completionHandler:) via origNewPipelineAsync.
+// This is SAFE to call while a render command encoder is active — Metal
+// queues the GPU compile internally and fires completion when done.
+// All callers that previously used the sync version during active match
+// rendering should use this instead to avoid Metal vertex-function conflicts.
+
+static void buildVariantPipelineAsync(id device,
+                                       MTLRenderPipelineDescriptor *base,
+                                       id<MTLLibrary> vLib,
+                                       id<MTLLibrary> fLib,
+                                       FMPipelineCompletion completion) {
+    if (!base || (!vLib && !fLib)) { if (completion) completion(nil); return; }
+    MTLRenderPipelineDescriptor *d = [base copy];
+    if (vLib) {
+        NSString *ovr = objc_getAssociatedObject(vLib, &kReplaceFuncKey);
+        NSString *fnName = ovr ?: base.vertexFunction.name;
+        id<MTLFunction> fn = [vLib newFunctionWithName:fnName];
+        if (!fn) {
+            fmLog([NSString stringWithFormat:@"[ASYNC VAR] vLib fn '%@' not found", fnName]);
+            if (completion) completion(nil); return;
+        }
+        d.vertexFunction = fn;
+    }
+    if (fLib) {
+        NSString *ovr = objc_getAssociatedObject(fLib, &kReplaceFuncKey);
+        NSString *fnName = ovr ?: base.fragmentFunction.name;
+        id<MTLFunction> fn = [fLib newFunctionWithName:fnName];
+        if (!fn) {
+            fmLog([NSString stringWithFormat:@"[ASYNC VAR] fLib fn '%@' not found", fnName]);
+            if (completion) completion(nil); return;
+        }
+        d.fragmentFunction = fn;
+        if (ovr) {
+            for (NSUInteger i = 0; i < 8; i++) {
+                MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
+                if (ca.pixelFormat != MTLPixelFormatInvalid) {
+                    ca.blendingEnabled = NO;
+                    ca.writeMask = MTLColorWriteMaskAll;
+                }
+            }
+        }
+    }
+    // Metal async API — internally safe during active render passes
+    origNewPipelineAsync(device,
+        @selector(newRenderPipelineStateWithDescriptor:completionHandler:),
+        d,
+        ^(id<MTLRenderPipelineState> ps, NSError *err) {
+            if (err) {
+                NSString *em = [NSString stringWithFormat:@"[ASYNC VAR ERR] %@", err.localizedDescription ?: @"nil"];
+                dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:em]; });
+            }
+            if (completion) completion(ps);
+        });
+}
+
 static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cmd,
                                                                   MTLRenderPipelineDescriptor *desc,
                                                                   NSError **error) {
@@ -1307,37 +1406,53 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
                 fmLog([NSString stringWithFormat:@"[ASYNC BUILD] annullato (kill) %@", pairKey]);
                 return;
             }
+            if (!colorNowCopy && !flLibCopy) return; // nothing to build
 
-            NSMutableDictionary *variants = [NSMutableDictionary dictionary];
+            // Use Metal's own async compilation API — safe while the game's render
+            // command encoders are active (no vertex-function conflict).
+            __block id<MTLRenderPipelineState> cpResult = nil;
+            __block id<MTLRenderPipelineState> fpResult = nil;
+            dispatch_group_t grp = dispatch_group_create();
+
             if (colorNowCopy && (cvLibCopy || cfLibCopy)) {
-                id<MTLRenderPipelineState> cp = buildVariantPipeline(selfDevice, descCopy, cvLibCopy, cfLibCopy);
-                if (cp) variants[@"color"] = cp;
+                dispatch_group_enter(grp);
+                buildVariantPipelineAsync(selfDevice, descCopy, cvLibCopy, cfLibCopy,
+                    ^(id<MTLRenderPipelineState> ps) { cpResult = ps; dispatch_group_leave(grp); });
             }
             if (flLibCopy) {
-                id<MTLRenderPipelineState> fp = buildVariantPipeline(selfDevice, descCopy, nil, flLibCopy);
-                if (fp) variants[@"flash"] = fp;
+                dispatch_group_enter(grp);
+                buildVariantPipelineAsync(selfDevice, descCopy, nil, flLibCopy,
+                    ^(id<MTLRenderPipelineState> ps) { fpResult = ps; dispatch_group_leave(grp); });
             }
-            if (variants.count == 0) return;
 
-            // Final cancellation + address-reuse guard before writing
-            if (gPatchBuildGen != genAtCapture) return;
-            BOOL written = NO;
-            @synchronized(gHookLock) {
-                if (gPatchBuildGen == genAtCapture &&
-                    [pipelineGeneration[pKeyCopy] unsignedIntegerValue] == capturedGenCopy) {
-                    pipelinePatches[pKeyCopy] = variants;
-                    [pipelineDescriptors removeObjectForKey:pKeyCopy]; // anti-OOM
-                    written = YES;
+            dispatch_group_notify(grp,
+                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+
+                if (gPatchBuildGen != genAtCapture) return;
+                NSMutableDictionary *variants = [NSMutableDictionary dictionary];
+                if (cpResult) variants[@"color"] = cpResult;
+                if (fpResult) variants[@"flash"] = fpResult;
+                if (variants.count == 0) return;
+
+                if (gPatchBuildGen != genAtCapture) return;
+                BOOL written = NO;
+                @synchronized(gHookLock) {
+                    if (gPatchBuildGen == genAtCapture &&
+                        [pipelineGeneration[pKeyCopy] unsignedIntegerValue] == capturedGenCopy) {
+                        pipelinePatches[pKeyCopy] = variants;
+                        [pipelineDescriptors removeObjectForKey:pKeyCopy]; // anti-OOM
+                        written = YES;
+                    }
                 }
-            }
-            if (written) {
-                NSString *msg = [NSString stringWithFormat:
-                    @"[ASYNC BUILD â] color:%d flash:%d frag=%04lx vert=%04lx",
-                    variants[@"color"]!=nil, variants[@"flash"]!=nil,
-                    (unsigned long)(fHashCopy ? fHashCopy.unsignedIntegerValue & 0xFFFF : 0),
-                    (unsigned long)(vHashCopy ? vHashCopy.unsignedIntegerValue & 0xFFFF : 0)];
-                dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:msg]; });
-            }
+                if (written) {
+                    NSString *msg = [NSString stringWithFormat:
+                        @"[BUILD â] color:%d flash:%d frag=%04lx vert=%04lx",
+                        cpResult!=nil, fpResult!=nil,
+                        (unsigned long)(fHashCopy ? fHashCopy.unsignedIntegerValue & 0xFFFF : 0),
+                        (unsigned long)(vHashCopy ? vHashCopy.unsignedIntegerValue & 0xFFFF : 0)];
+                    dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:msg]; });
+                }
+            });
         });
     }
     return orig;
@@ -1746,7 +1861,15 @@ void fmClearAllShaderPatches(void) {
         if (flashTimer) { [flashTimer invalidate]; flashTimer = nil; }
         flashVisible = NO;
     });
-    fmLog(@"[SAFETY] Tutti i patch shader azzerati (deep reset)");
+    // Wipe NSUserDefaults so crash loop cannot restart on next launch.
+    // Without this, _savedPatchCache reloads the activated shader on restart
+    // → patchChangedHandler fires in-match → Metal variant build → crash again.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"FMSavedPatches_v3"];
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"FMHooksEnabled"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    });
+    fmLog(@"[SAFETY] Tutti i patch shader azzerati (deep reset) — NSUserDefaults wipati");
 }
 
 // ── Live-active hash accessor (called from ShaderPage LIVE filter) ────────────
