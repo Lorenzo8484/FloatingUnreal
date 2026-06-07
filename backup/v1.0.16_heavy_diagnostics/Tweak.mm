@@ -463,26 +463,51 @@ static id<MTLLibrary> compileDirect(NSString *src, MTLCompileOptions *opts) {
 }
 
 
-// ── Crash-surviving diagnostics ─────────────────────────────────────────────
-// Writes to syslog (NSLog) AND to a file on disk that persists after crash.
-// Path: /var/mobile/Library/Preferences/fmdiag.txt
-static FILE *gDiagFile = NULL;
+// ── Crash-surviving diagnostics (NSUserDefaults circular buffer) ─────────────
+// Each fmDiag call appends to a 50-entry ring stored under "FMDiagLog" in
+// NSUserDefaults. The write is synchronous + synchronize() so lines persist
+// even if the process is killed before the main-queue dispatch fires.
+// On next launch, fmShowPreCrashLog() reads them back into the inspector.
+#define FM_DIAG_KEY  @"FMDiagLog"
+#define FM_DIAG_MAX  50
 static os_unfair_lock gDiagLock = OS_UNFAIR_LOCK_INIT;
+
 static void fmDiag(NSString *msg) {
+    if (!msg) return;
     NSLog(@"[FM-DIAG] %@", msg);
+    // Persist to NSUserDefaults synchronously so it survives a crash.
     os_unfair_lock_lock(&gDiagLock);
-    if (!gDiagFile) {
-        gDiagFile = fopen("/var/mobile/Library/Preferences/fmdiag.txt", "a");
-    }
-    if (gDiagFile) {
-        NSString *ts = [NSDate dateWithTimeIntervalSinceNow:0].description;
-        fprintf(gDiagFile, "[%s] %s\n",
-            [ts UTF8String] ?: "?",
-            [msg UTF8String] ?: "?");
-        fflush(gDiagFile);
+    @autoreleasepool {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSMutableArray *log = [[ud arrayForKey:FM_DIAG_KEY] mutableCopy]
+                               ?: [NSMutableArray array];
+        NSString *ts = [NSString stringWithFormat:@"%.3f", CACurrentMediaTime()];
+        [log addObject:[NSString stringWithFormat:@"[%@] %@", ts, msg]];
+        while (log.count > FM_DIAG_MAX) [log removeObjectAtIndex:0];
+        [ud setObject:log forKey:FM_DIAG_KEY];
+        [ud synchronize];
     }
     os_unfair_lock_unlock(&gDiagLock);
+    // Also push to the live UI panel (may not fire before crash, that's OK).
     dispatch_async(dispatch_get_main_queue(), ^{ if (floatingMenu) [floatingMenu addLog:msg]; });
+}
+
+// Call once at UI start — shows pre-crash lines saved in previous session.
+static void fmShowPreCrashLog(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSArray *saved = [ud arrayForKey:FM_DIAG_KEY];
+    if (!saved.count) return;
+    // Display all saved lines with [PRE-CRASH] prefix, then clear.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!floatingMenu) return;
+        [floatingMenu addLog:@"━━━ PRE-CRASH LOG (sessione precedente) ━━━"];
+        for (NSString *line in saved)
+            [floatingMenu addLog:[NSString stringWithFormat:@"[PRE] %@", line]];
+        [floatingMenu addLog:@"━━━ FINE PRE-CRASH LOG ━━━"];
+    });
+    // Clear so we don't show stale lines on a clean launch.
+    [ud removeObjectForKey:FM_DIAG_KEY];
+    [ud synchronize];
 }
 
 // Forward declaration — defined later, after the pipeline-state hook helpers
@@ -2186,6 +2211,7 @@ static void lc_init() {
 
         [floatingMenu show];
         [floatingMenu addLog:@"[INFO] Menu attivato"];
+        fmShowPreCrashLog(); // show logs from crash in previous session
 
         // Auto-enable hooks 3s after UI is ready.
         // Starting with hooks OFF prevents crashes during UE's Metal init.
