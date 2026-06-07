@@ -1,0 +1,9 @@
+Package: com.lorenzo8484.floatingunreal
+Name: FloatingUnreal
+Version: 1.0.17
+Architecture: iphoneos-arm64
+Description: Floating Metal shader inspector & patcher for Unreal Engine games
+Maintainer: Lorenzo8484
+Author: Lorenzo8484
+Section: Tweaks
+Depends: mobilesubstrate
