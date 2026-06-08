@@ -13,16 +13,16 @@ LLD=/nix/store/a8zn2v3wyi393iahnjddnsgh05idj7y3-lld-19.1.7/bin/ld64.lld
 LDID=/nix/store/2mq8dg7hgq1rp0bhdm59l4jl71w5pw30-ldid-2.1.5/bin/ldid
 RESDIR=/nix/store/4bb195ym905lzvwnbm86nxz2j625hrv4-clang-wrapper-19.1.7/resource-root
 
-SDK=/tmp/sdk/iPhoneOS16.5.sdk
+SDK=/home/runner/workspace/sdk/iPhoneOS16.5.sdk
 SDK_URL="https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
 
 echo "=== AFloatingUnreal v${VER} build ==="
 
-# Download SDK if missing (/tmp is ephemeral)
+# Download SDK only if missing — now lives in workspace (persistent, not /tmp)
 if [ ! -d "$SDK" ]; then
     echo "Downloading iOS SDK..."
-    mkdir -p /tmp/sdk
-    curl -fsSL --retry 3 "$SDK_URL" | tar -xJC /tmp/sdk/
+    mkdir -p /home/runner/workspace/sdk
+    curl -fsSL --retry 3 "$SDK_URL" | tar -xJC /home/runner/workspace/sdk/
 fi
 
 BUILDTMP=/tmp/afloat_build
