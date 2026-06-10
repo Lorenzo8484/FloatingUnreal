@@ -176,7 +176,48 @@ static _Atomic(BOOL) gCaptureSourceLibs = NO;  // mirrors gHooksEnabled — set 
 static _Atomic(BOOL) gCaptureBinaryLibs = YES; // binary metallib capture attiva — patch R/G/B via const-color override
 
 // ── Global state lock ─────────────────────────────────────────────────────────
-// ALL NSMutableDictionary / NSMutableSet accesses MUST be inside @synchronized(gHookLock).
+// ── Shader Dumper (v2.1) ──────────────────────────────────────────────────────
+// Raccoglie tutti gli shader Metal runtime (MSL source + pipeline info) e li
+// salva in /var/mobile/Documents/bp_shaders_dump.json
+static NSMutableArray      *gDumpedShaders   = nil;   // array of NSDictionary
+static BOOL                 gDumpEnabled     = YES;
+static int                  gDumpCount       = 0;
+static dispatch_once_t      gDumpOnce;
+
+// Forward declaration
+static void fmFlushShaderDump(void);
+
+// Scrive il dump su file JSON
+static void fmWriteShaderDump(void) {
+    @synchronized(gHookLock) {
+        if (!gDumpedShaders || gDumpedShaders.count == 0) return;
+        
+        NSString *path = @"/var/mobile/Documents/bp_shaders_dump.json";
+        NSError *err = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:gDumpedShaders
+                                                       options:NSJSONWritingPrettyPrinted
+                                                         error:&err];
+        if (!json || err) {
+            fmLog([NSString stringWithFormat:@"[DUMP] JSON serialize error: %@", err]);
+            return;
+        }
+        [json writeToFile:path atomically:YES];
+        fmLog([NSString stringWithFormat:@"[DUMP] ✅ Scritti %lu shader in %@ (%.1f KB)",
+               (unsigned long)gDumpedShaders.count, path, json.length / 1024.0]);
+    }
+}
+
+// Aggiunge uno shader al dump array; flush automatico ogni 50
+static void fmCollectShaderDump(NSDictionary *entry) {
+    @synchronized(gHookLock) {
+        if (!gDumpedShaders) gDumpedShaders = [NSMutableArray array];
+        [gDumpedShaders addObject:entry];
+        gDumpCount++;
+        if (gDumpedShaders.count >= 50) {
+            fmWriteShaderDump();
+        }
+    }
+}
 // Metal fires library/pipeline hooks from multiple background threads concurrently;
 // without this lock every dictionary mutation is a guaranteed crash.
 static NSObject *gHookLock = nil;
@@ -1445,6 +1486,22 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
         // Persistent per-frag-hash cache: survives burst-detector purge.
         // rebuildVariantsForHash uses this as fallback when pipelineDescriptors[pk] is gone.
         if (fHash) pipelineDescByFragHash[fHash] = descCopy;
+        
+        // v2.1: Shader Dumper — raccogli info pipeline (vertex/fragment names + formati)
+        if (gDumpEnabled && descCopy) {
+            NSMutableDictionary *pipe = [NSMutableDictionary dictionary];
+            pipe[@\"type\"] = @\"pipeline\";
+            pipe[@\"vHash\"] = vHash ?: @0;
+            pipe[@\"fHash\"] = fHash ?: @0;
+            pipe[@\"vFunc\"] = desc.vertexFunction.name ?: @\"?\";
+            pipe[@\"fFunc\"] = desc.fragmentFunction.name ?: @\"?\";
+            pipe[@\"pixelFormat\"] = @(desc.colorAttachments[0].pixelFormat);
+            pipe[@\"depthFormat\"] = @(desc.depthAttachmentPixelFormat);
+            pipe[@\"blending\"] = desc.colorAttachments[0].blendingEnabled ? @YES : @NO;
+            pipe[@\"sampleCount\"] = @(desc.sampleCount);
+            pipe[@\"timestamp\"] = @([[NSDate date] timeIntervalSince1970]);
+            fmCollectShaderDump(pipe);
+        }
         // Burst detector: 10+ pipeline nuove in 1 s → transizione scena → svuota i vecchi
         // descriptor per rilasciare i MTLFunction/MTLLibrary del gioco.
         // IMPORTANTE: non toccare pipelinePatches — sono i nostri variant compilati (non
@@ -1845,6 +1902,19 @@ static id<MTLLibrary> hooked_newLibraryWithSource(id self, SEL _cmd,
     @synchronized(gHookLock) {
         capturedSources[hKey]      = source;
         capturedSourceNames[hKey]  = name;   // saved for replay after floatingMenu init
+        
+        // v2.1: Shader Dumper — raccogli source MSL con metadata
+        if (gDumpEnabled) {
+            NSDictionary *entry = @{
+                @\"type\": @\"library\",
+                @\"hash\": hKey,
+                @\"name\": name ?: @\"unknown\",
+                @\"source\": source ?: @\"\",
+                @\"sourceLen\": @(source.length),
+                @\"timestamp\": @([[NSDate date] timeIntervalSince1970])
+            };
+            fmCollectShaderDump(entry);
+        }
         // v1.0.35: do NOT store strong lib ref — prevents game releasing compiled GPU lib → OOM
         if (options) capturedOptions[hKey] = options;
     }
@@ -2856,5 +2926,17 @@ static void lc_init() {
         // The crash flag system (gCrashFlagFD) auto-resets hooks to OFF after any crash.
     }];
     NSLog(@"[FM] lc_init done");
+    
+    // v2.1: Shader Dumper — flush automatico periodico
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        fmWriteShaderDump();
+        fmLog(@"[DUMP] Primo flush completato dopo 8s");
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        fmWriteShaderDump();
+        fmLog(@"[DUMP] Flush periodico 60s");
+    });
     } // @autoreleasepool
 }

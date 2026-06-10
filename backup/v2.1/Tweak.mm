@@ -180,6 +180,10 @@ static _Atomic(BOOL) gCaptureBinaryLibs = YES; // binary metallib capture attiva
 // Metal fires library/pipeline hooks from multiple background threads concurrently;
 // without this lock every dictionary mutation is a guaranteed crash.
 static NSObject *gHookLock = nil;
+// ── Shader Dumper v2.1 ────────────────────────────────────────────────────────
+static NSMutableArray      *gDumpedShaders   = nil;
+static BOOL                 gDumpEnabled     = YES;
+
 
 // ── Pixel-format short name (for render-target diagnostics) ───────────────────
 static NSString *fmFmtName(MTLPixelFormat f) {
@@ -352,6 +356,30 @@ static BOOL fmLastReturn(NSString *body, NSRange *outExpr, NSRange *outStmt) {
     *outExpr = NSMakeRange(vs, semi.location - vs);
     *outStmt = NSMakeRange(last.location, semi.location + 1 - last.location);
     return YES;
+}
+
+// ── Shader Dumper v2.1 ────────────────────────────────────────────────────────
+static void fmWriteShaderDump(void) {
+    @synchronized(gHookLock) {
+        if (!gDumpedShaders || gDumpedShaders.count == 0) return;
+        NSString *path = @"/var/mobile/Documents/bp_shaders_dump.json";
+        NSError *err = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:gDumpedShaders
+                                                       options:NSJSONWritingPrettyPrinted
+                                                         error:&err];
+        if (json && !err) {
+            [json writeToFile:path atomically:YES];
+            fmLog([NSString stringWithFormat:@"[DUMP] Scritti %lu shader in %@ (%.1f KB)",
+                   (unsigned long)gDumpedShaders.count, path, json.length / 1024.0]);
+        }
+    }
+}
+static void fmCollectShaderDump(NSDictionary *entry) {
+    @synchronized(gHookLock) {
+        if (!gDumpedShaders) gDumpedShaders = [NSMutableArray array];
+        [gDumpedShaders addObject:entry];
+        if (gDumpedShaders.count >= 50) fmWriteShaderDump();
+    }
 }
 
 // Inject RGB color override into last return of the fragment function.
@@ -1445,6 +1473,16 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
         // Persistent per-frag-hash cache: survives burst-detector purge.
         // rebuildVariantsForHash uses this as fallback when pipelineDescriptors[pk] is gone.
         if (fHash) pipelineDescByFragHash[fHash] = descCopy;
+        // v2.1: Shader Dumper
+        if (gDumpEnabled && descCopy) {
+            fmCollectShaderDump(@{@"type":@"pipeline",
+                @"vHash":(vHash?:@0), @"fHash":(fHash?:@0),
+                @"vFunc":(desc.vertexFunction.name?:@"?"),
+                @"fFunc":(desc.fragmentFunction.name?:@"?"),
+                @"pixelFormat":@(desc.colorAttachments[0].pixelFormat),
+                @"depthFormat":@(desc.depthAttachmentPixelFormat),
+                @"blending":@(desc.colorAttachments[0].blendingEnabled)});
+        }
         // Burst detector: 10+ pipeline nuove in 1 s → transizione scena → svuota i vecchi
         // descriptor per rilasciare i MTLFunction/MTLLibrary del gioco.
         // IMPORTANTE: non toccare pipelinePatches — sono i nostri variant compilati (non
@@ -1845,6 +1883,12 @@ static id<MTLLibrary> hooked_newLibraryWithSource(id self, SEL _cmd,
     @synchronized(gHookLock) {
         capturedSources[hKey]      = source;
         capturedSourceNames[hKey]  = name;   // saved for replay after floatingMenu init
+        // v2.1: Shader Dumper
+        if (gDumpEnabled && source) {
+            fmCollectShaderDump(@{@"type":@"library", @"hash":hKey,
+                @"name":(name?:@"?"), @"sourceLen":@(source.length),
+                @"source":source});
+        }
         // v1.0.35: do NOT store strong lib ref — prevents game releasing compiled GPU lib → OOM
         if (options) capturedOptions[hKey] = options;
     }
@@ -2856,5 +2900,8 @@ static void lc_init() {
         // The crash flag system (gCrashFlagFD) auto-resets hooks to OFF after any crash.
     }];
     NSLog(@"[FM] lc_init done");
+    // v2.1: Shader Dumper — flush after shader burst
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ fmWriteShaderDump(); });
     } // @autoreleasepool
 }

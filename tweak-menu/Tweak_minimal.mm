@@ -97,7 +97,9 @@ static NSMutableDictionary *pipelineDescByFragHash = nil;
 static NSMutableDictionary *pipelineGeneration   = nil; // pKey → NSNumber(generation); incremented on every new registration at that address
 static NSMutableSet        *flashHashes         = nil; // @(hash) with flash ON
 static NSMutableSet        *activeColorHashes   = nil; // @(hash) with color/vertex patch ON
-static NSMutableSet        *gLiveActiveHashes   = nil; // @(hash) seen in setRenderPipelineState this frame
+static NSMutableSet        *gLiveActiveHashes   = nil;
+static NSMutableDictionary *pipelineReflections  = nil;
+static NSMutableSet        *gReflectionBuiltPairs = nil;
 static BOOL                 flashVisible        = NO;
 static NSTimer             *flashTimer          = nil;
 // Burst detector: se 10+ pipeline NUOVE arrivano in 1 secondo → transizione scena
@@ -2740,6 +2742,8 @@ static void lc_init() {
     flashHashes         = [[NSMutableSet alloc] init];
     activeColorHashes   = [[NSMutableSet alloc] init];
     gLiveActiveHashes   = [[NSMutableSet alloc] init];
+    pipelineReflections  = [[NSMutableDictionary alloc] init];
+    gReflectionBuiltPairs = [[NSMutableSet alloc] init];
     gBuiltVariantPairs  = [[NSMutableSet alloc] init];
     NSLog(@"[FM] dizionari inizializzati");
 

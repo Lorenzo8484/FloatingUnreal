@@ -1413,17 +1413,16 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
         BOOL colorNowCopy          = colorNow;
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            dispatch_get_main_queue(), ^{
 
             // Abort if kill switch fired while waiting
             if (gPatchBuildGen != genAtCapture) {
-                fmLog([NSString stringWithFormat:@"[ASYNC BUILD] annullato (kill) %@", pairKey]);
                 return;
             }
 
             // ── Build GPU reflection for this pipeline pair (ONE-TIME, deduped) ──
-            // Runs even when no patches are active — gives us shader metadata
-            // for EVERY pipeline the game uses, regardless of patching state.
+            // MUST run on main thread — Metal pipeline compilation with reflection
+            // can't happen concurrently with active rendering on background queues.
             {
                 NSString *reflectKey = [NSString stringWithFormat:@"%@|%@",
                     fHashCopy ? [NSString stringWithFormat:@"%lx", fHashCopy.unsignedIntegerValue] : @"0",
@@ -1436,7 +1435,11 @@ static id<MTLRenderPipelineState> hooked_newRenderPipelineState(id self, SEL _cm
                     }
                 }
                 if (doReflect && descCopy) {
-                    fmBuildReflectionForDesc(selfDevice, descCopy, reflectKey);
+                    @try {
+                        fmBuildReflectionForDesc(selfDevice, descCopy, reflectKey);
+                    } @catch (NSException *e) {
+                        fmLog([NSString stringWithFormat:@"[REFL CRASH GUARD] %@ → %@", reflectKey, e.reason]);
+                    }
                 }
             }
 
