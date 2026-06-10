@@ -4,10 +4,6 @@
 @implementation ShaderEntry
 @end
 
-// Reflection API (defined in Tweak.xm) — GPU metadata extraction
-extern NSDictionary *fmGetReflectionForPair(NSString *pairKey);
-extern NSDictionary *fmGetBestReflectionForHash(NSNumber *hashKey);
-
 @interface ShaderPage () <UITableViewDelegate, UITableViewDataSource, UITextFieldDelegate, UIGestureRecognizerDelegate> {
     NSInteger             _currentTab;       // 0=Shaders 1=Memory 2=Export
     BOOL                  _expanded;
@@ -2142,27 +2138,6 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
         }
         entry.vglobalsName = vgName ?: @"struct VGlobals_Type";
         entry.vglobalsText = vgBody;
-    }
-
-    // ── GPU Reflection fallback (for obfuscated / non-MSL shaders) ──────────
-    // If struct parsing from MSL source produced nothing (empty/null structBody),
-    // use Metal's MTLRenderPipelineReflection API to extract the REAL buffer layouts
-    // from the compiled pipeline state. Works for ALL shaders regardless of format.
-    if ((!entry.subMembersText || entry.subMembersText.length < 10) &&
-        (!entry.vglobalsText || entry.vglobalsText.length < 10)) {
-        NSDictionary *refl = fmGetBestReflectionForHash(@(entry.sourceHash));
-        if (refl) {
-            NSString *rBody = refl[@"structBody"];
-            NSString *rName = refl[@"structName"];
-            if (rBody && rBody.length > 4) {
-                // Populate BOTH columns from reflection
-                entry.subMembersText = rBody;
-                entry.displayName    = rName ?: @"struct GPU_Reflection";
-                entry.vglobalsName   = [NSString stringWithFormat:@"%@ (buffer[%@])",
-                    refl[@"argName"] ?: @"?", refl[@"from"] ?: @"?"];
-                entry.vglobalsText   = rBody;
-            }
-        }
     }
 
     // ── Restore saved patch state (persists across game restarts) ──────────────
