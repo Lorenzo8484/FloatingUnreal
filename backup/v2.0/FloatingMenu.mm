@@ -380,13 +380,9 @@ static NSString *fmLogFilePath(void) {
 
     [self.menuWindow.rootViewController.view addSubview:self.shaderPage];
 
-    // Restore saved hook state from previous session
     BOOL savedHooks = [[NSUserDefaults standardUserDefaults] boolForKey:@"FMHooksEnabled"];
-    if (savedHooks) {
-        // gHooksEnabled was already set in lc_init; just sync the UI
-        [self.shaderPage applyHookSwitchState:YES];
-        [self addLog:@"[INFO] ⚡ Hooks ON — ripristinati da sessione precedente"];
-    }
+    [self.shaderPage applyHookSwitchState:savedHooks];
+    [self addLog:savedHooks ? @"[INFO] Hooks ON — ripristinato dallo stato precedente" : @"[INFO] Hooks OFF — premi ⚡ ON per attivare le patch"];
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -418,8 +414,8 @@ static NSString *fmLogFilePath(void) {
     });
 }
 
-- (void)captureShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error {
-    [self.shaderPage addShaderWithName:name source:source error:error];
+- (void)captureShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error libHash:(NSUInteger)libHash {
+    [self.shaderPage addShaderWithName:name source:source error:error libHash:libHash];
     [self addLog:[NSString stringWithFormat:@"[SHADER] %@ — %@",
                   name, error.length > 0 ? @"ERROR" : @"OK"]];
 }
@@ -475,7 +471,8 @@ static NSString *fmLogFilePath(void) {
 - (void)iconLongPressed:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
 
-    // 1. Disable all Metal hooks (pass-through mode — no interception)
+    // 1. Disable ALL hooks + persist to NSUserDefaults (fmSetHooksEnabled calls synchronize)
+    //    so the NEXT launch starts with hooks=NO even after a GPU crash (no POSIX signal).
     fmSetHooksEnabled(NO);
     [self.shaderPage applyHookSwitchState:NO];
 

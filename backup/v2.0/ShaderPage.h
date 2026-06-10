@@ -55,7 +55,7 @@ typedef NS_ENUM(NSInteger, FragPatchColor) {
 @property (nonatomic, copy) void (^headerTappedHandler)(void);
 
 - (ShaderEntry *)entryForSourceHash:(NSUInteger)hash;
-- (void)addShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error;
+- (void)addShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error libHash:(NSUInteger)libHash;
 - (void)clearShaders;
 - (void)refresh;
 - (void)applyHookSwitchState:(BOOL)enabled;

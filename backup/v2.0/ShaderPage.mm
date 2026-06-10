@@ -17,7 +17,8 @@ extern NSDictionary *fmGetBestReflectionForHash(NSNumber *hashKey);
     NSInteger             _sortMode;          // 0=default  1=↑ smallest first  2=↓ largest first
     BOOL                  _liveFilterActive;  // YES = show only shaders active in current frame
     NSSet                *_liveSnapshotHashes; // immutable snapshot taken when LIVE button tapped
-    NSMutableDictionary  *_savedPatchCache;   // keyed by shader name, persisted to NSUserDefaults
+    NSMutableDictionary  *_savedPatchCache;   // keyed by stableKey, persisted to NSUserDefaults (patches only)
+    NSMutableDictionary  *_starredCache;      // keyed by stableKey, persisted separately — NEVER wiped by patch reset
     UIView               *_exportView;        // full-panel view for Export tab
     UITextView           *_exportTextView;    // shows the generated .m source
     CGPoint               _savedShaderScrollOffset; // preserves scroll when switching tabs
@@ -81,6 +82,7 @@ static const char kBaseTagKey2 = 'T';
 static NSString * const kReuseVert    = @"FM_V2";
 static NSString * const kReuseFrag    = @"FM_F2";
 static NSString * const kReuseBoth    = @"FM_B2";
+static NSString * const kReuseNone    = @"FM_N2"; // placeholder: neither flag known yet
 static NSString * const kReuseDivider = @"FM_DIV";
 
 // Forward declarations (defined near detail view code at bottom of file)
@@ -527,9 +529,19 @@ static void applyStar(UIButton *btn, BOOL saved) {
 - (UITableViewCell *)makeCellForEntry:(ShaderEntry *)entry tableView:(UITableView *)tv {
     BOOL showFrag = entry.hasFragmentFunction;
     BOOL showVert = entry.hasVertexFunction;
-    NSString *rID = (showFrag && showVert) ? kReuseBoth : showVert ? kReuseVert : kReuseFrag;
+    // kReuseNone keeps placeholder cells (neither flag) out of the kReuseFrag pool.
+    // When AIR reflection later promotes flags, reloadData picks kReuseFrag/Vert/Both
+    // and finds no stale button-free cell in that pool → creates a fresh cell with buttons.
+    NSString *rID = (showFrag && showVert) ? kReuseBoth
+                  : showFrag              ? kReuseFrag
+                  : showVert             ? kReuseVert
+                  :                        kReuseNone;
 
     UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:rID];
+    // Safety: if dequeued cell is missing required buttons (stale from a flags-upgrade race),
+    // discard it so a fresh cell with the correct button set is created.
+    if (cell && showFrag && ![cell.contentView viewWithTag:kTagR]) cell = nil;
+    if (cell && showVert && ![cell.contentView viewWithTag:kTagVert]) cell = nil;
     if (cell) return cell;
 
     cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rID];
@@ -1349,31 +1361,39 @@ static void applyStar(UIButton *btn, BOOL saved) {
 // ── Patch persistence (NSUserDefaults — sopravvive al riavvio) ────────────────
 
 static NSString * const kPatchDefaultsKey = @"FMSavedPatches_v3";
+static NSString * const kStarDefaultsKey  = @"FMStarredShaders_v1"; // stars — mai cancellato da patch reset
 
-// ── Stable persistence key: function name + source char-length ─────────────────
-// Source length is invariant between sessions for the same app version.
-// Avoids using [source hash] (per-process salted on iOS) or full-source DJB2
-// (breaks if Unity changes even one embedded constant between sessions).
-static NSString *fmStableKey(NSString *name, NSString *source) {
-    // Use content hash (not length) — UE shaders have same name AND same length → dedup
-    NSUInteger h = [(source ?: @"") hash];
+// ── DJB2 hash: deterministic across process restarts (NSString.hash è salted per-process) ──
+static NSUInteger fmDJB2(NSString *s) {
+    NSUInteger h = 5381;
+    NSUInteger n = s.length;
+    for (NSUInteger i = 0; i < n; i++)
+        h = ((h << 5) + h) ^ (NSUInteger)[s characterAtIndex:i];
+    return h;
+}
+
+// ── Stable persistence key ─────────────────────────────────────────────────────
+// Per binary metallib: usa libHash (già nel nome come [bc38]) — non dipende dalla source.
+// Per MSL: usa DJB2 della source — stabile tra sessioni.
+static NSString *fmStableKey(NSString *name, NSString *source, NSUInteger libHash) {
+    NSUInteger h = libHash > 0 ? libHash : fmDJB2(source ?: @"");
     return [NSString stringWithFormat:@"%@_%lx", name ?: @"unnamed", (unsigned long)h];
 }
 
 - (void)_loadPatchCache {
-    NSDictionary *raw = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kPatchDefaultsKey];
-    _savedPatchCache = raw ? [raw mutableCopy] : [NSMutableDictionary dictionary];
+    NSDictionary *rawP = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kPatchDefaultsKey];
+    _savedPatchCache = rawP ? [rawP mutableCopy] : [NSMutableDictionary dictionary];
+    NSDictionary *rawS = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kStarDefaultsKey];
+    _starredCache = rawS ? [rawS mutableCopy] : [NSMutableDictionary dictionary];
 }
 
 - (void)_persistEntry:(ShaderEntry *)entry {
     if (!entry || entry.isDivider || !entry.name.length || !entry.stableKey.length) return;
-    BOOL hasAny = entry.isSaved
-               || entry.patchFragColor != FragPatchNone
-               || entry.patchFlash
-               || entry.patchVertex;
-    if (hasAny) {
+
+    // ── Patch cache (FMSavedPatches_v3) — azzerato da patch-reset/safe-mode ──
+    BOOL hasPatch = entry.patchFragColor != FragPatchNone || entry.patchFlash || entry.patchVertex;
+    if (hasPatch || entry.customName.length > 0) {
         _savedPatchCache[entry.stableKey] = @{
-            @"s": @(entry.isSaved),
             @"c": @((NSInteger)entry.patchFragColor),
             @"f": @(entry.patchFlash),
             @"v": @(entry.patchVertex),
@@ -1384,6 +1404,15 @@ static NSString *fmStableKey(NSString *name, NSString *source) {
     }
     [[NSUserDefaults standardUserDefaults] setObject:[_savedPatchCache copy]
                                              forKey:kPatchDefaultsKey];
+
+    // ── Star cache (FMStarredShaders_v1) — MAI azzerato da patch-reset ──
+    if (entry.isSaved) {
+        _starredCache[entry.stableKey] = @{ @"s": @YES, @"k": entry.stableKey };
+    } else {
+        [_starredCache removeObjectForKey:entry.stableKey];
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:[_starredCache copy]
+                                             forKey:kStarDefaultsKey];
 }
 
 // ── UIGestureRecognizerDelegate — ignora tap-to-close se tocca un UIButton ────
@@ -1995,22 +2024,37 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
 
 // ── Public API ──────────────────────────────────────────────────────────────────
 
-- (void)addShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error {
+- (void)addShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error libHash:(NSUInteger)libHash {
     ShaderEntry *entry = [ShaderEntry new];
     entry.name       = name ?: @"unnamed_shader";
     entry.source     = source ?: @"";
-    entry.stableKey  = fmStableKey(entry.name, entry.source); // deterministic, survives restarts
+    entry.stableKey  = fmStableKey(entry.name, entry.source, libHash); // binary→libHash, MSL→DJB2
     entry.errorInfo  = error;
     entry.capturedAt = [NSDate date];
-    entry.sourceHash = [source hash];
+    entry.sourceHash = libHash; // real kLibHashKey from Tweak.mm — matches gLiveActiveHashes
     entry.isDivider  = NO;
 
     NSString *lower = [source lowercaseString];
-    entry.hasVertexFunction   = ([lower rangeOfString:@"vertex "].location   != NSNotFound);
-    entry.hasFragmentFunction = ([lower rangeOfString:@"fragment "].location != NSNotFound);
+    // Detect vertex/fragment presence:
+    // MSL shaders: "vertex funcName(" / "fragment funcName("  → "vertex " or "fragment " (space after keyword)
+    // Binary AIR reflected: "// ── vertex: funcName" / "// ── fragment: funcName" (colon after keyword)
+    entry.hasVertexFunction   = ([lower rangeOfString:@"vertex "].location   != NSNotFound)
+                             || ([lower rangeOfString:@"// ── vertex:"].location != NSNotFound)
+                             || ([lower rangeOfString:@"// ── vertex "].location != NSNotFound);
+    entry.hasFragmentFunction = ([lower rangeOfString:@"fragment "].location != NSNotFound)
+                             || ([lower rangeOfString:@"// ── fragment:"].location != NSNotFound)
+                             || ([lower rangeOfString:@"// ── fragment "].location != NSNotFound);
 
     if (entry.hasFragmentFunction) entry.fragIndex = ++_fragCount;
     if (entry.hasVertexFunction)   entry.vertIndex = ++_vertCount;
+
+    // ── Fallback per binary metallib senza header tipo rilevato ──────────────
+    // Se libHash > 0 (binary) ma né vertex né fragment rilevati dalla source,
+    // UE4 bias: tratta come fragment (fp_main ecc.). Assicura pulsanti B/R/G/V.
+    if (!entry.hasFragmentFunction && !entry.hasVertexFunction && libHash > 0) {
+        entry.hasFragmentFunction = YES;
+        entry.fragIndex = ++_fragCount;
+    }
 
     // ── Detect ANGLE shader (WebGL-Metal bridge, e.g. Bullet Echo) ──────────
     // ANGLE shaders carry specific struct names: defaultUniforms + ANGLEUniformBlock.
@@ -2111,22 +2155,25 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
             NSString *rBody = refl[@"structBody"];
             NSString *rName = refl[@"structName"];
             if (rBody && rBody.length > 4) {
-                // Populate BOTH columns from reflection:
-                // LEFT  = output struct member (we use the fragment arg struct if available)
-                // RIGHT = the buffer struct itself (uniforms)
+                // Populate BOTH columns from reflection
                 entry.subMembersText = rBody;
                 entry.displayName    = rName ?: @"struct GPU_Reflection";
                 entry.vglobalsName   = [NSString stringWithFormat:@"%@ (buffer[%@])",
                     refl[@"argName"] ?: @"?", refl[@"from"] ?: @"?"];
-                entry.vglobalsText   = rBody; // show same struct in both columns for now
+                entry.vglobalsText   = rBody;
             }
         }
     }
 
     // ── Restore saved patch state (persists across game restarts) ──────────────
+    // Stars (isSaved) from _starredCache — mai cancellato da patch reset.
+    // Patch flags (c/f/v/n) from _savedPatchCache — resettato da safe mode/clear.
+    NSDictionary *starred = _starredCache[entry.stableKey];
+    if (starred) {
+        entry.isSaved = [starred[@"s"] boolValue];
+    }
     NSDictionary *saved = _savedPatchCache[entry.stableKey];
     if (saved) {
-        entry.isSaved        = [saved[@"s"] boolValue];
         entry.patchFragColor = (FragPatchColor)[saved[@"c"] integerValue];
         entry.patchFlash     = [saved[@"f"] boolValue];
         entry.patchVertex    = [saved[@"v"] boolValue];
@@ -2142,6 +2189,35 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
                 });
             }
         }
+    }
+
+    // ── Deduplication by libHash ─────────────────────────────────────────────
+    // Binary metallibs are first captured as a placeholder (no vertex/fragment info)
+    // and then updated when AIR reflection completes. Instead of adding a duplicate
+    // entry, update the existing one in place so the cell gets the right badge/buttons.
+    ShaderEntry *existing = nil;
+    for (ShaderEntry *e in self.shaders) {
+        if (!e.isDivider && e.sourceHash == libHash) { existing = e; break; }
+    }
+
+    if (existing) {
+        // Update source and derived display fields; preserve all patch/save state.
+        existing.source         = entry.source;
+        existing.stableKey      = entry.stableKey;
+        existing.errorInfo      = entry.errorInfo;
+        existing.displayName    = entry.displayName;
+        existing.subMembersText = entry.subMembersText;
+        existing.vglobalsName   = entry.vglobalsName;
+        existing.vglobalsText   = entry.vglobalsText;
+        // Upgrade vertex/fragment flags if the reflected source revealed them.
+        if (!existing.hasVertexFunction   && entry.hasVertexFunction)
+            { existing.hasVertexFunction   = YES; existing.vertIndex = ++_vertCount; }
+        if (!existing.hasFragmentFunction && entry.hasFragmentFunction)
+            { existing.hasFragmentFunction = YES; existing.fragIndex = ++_fragCount; }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self applyFilter];
+        });
+        return;
     }
 
     [self.shaders addObject:entry];
@@ -2191,15 +2267,14 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
             [patched addObject:e];
     }
 
-    // 2. Reset all patch flags on every entry
+    // 2. Reset all patch flags on every entry (preserva isSaved — viene da _starredCache separato)
     for (ShaderEntry *e in self.shaders) {
         e.patchFragColor = FragPatchNone;
         e.patchFlash = NO;
         e.patchVertex = NO;
-        e.isSaved = NO;
     }
 
-    // 3. Wipe NSUserDefaults persistence (new v2 key)
+    // 3. Wipe patch persistence ONLY (non tocca _starredCache / FMStarredShaders_v1)
     [_savedPatchCache removeAllObjects];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPatchDefaultsKey];
 
@@ -2258,7 +2333,7 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
         e.patchShadeOverride = NO;
     }
 
-    // 3. Wipe patch persistence entirely
+    // 3. Wipe patch persistence ONLY (NON tocca _starredCache — stelle sopravvivono)
     [_savedPatchCache removeAllObjects];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPatchDefaultsKey];
 
@@ -2345,7 +2420,7 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
             [patched addObject:e];
     }
 
-    // Azzera tutti i flag su tutti gli entry (saved + patch)
+    // Azzera tutti i flag su tutti gli entry (saved + patch) — azione esplicita utente
     for (ShaderEntry *e in self.shaders) {
         e.patchFragColor = FragPatchNone;
         e.patchFlash     = NO;
@@ -2353,9 +2428,11 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
         e.isSaved        = NO;
     }
 
-    // Cancella persistenza
+    // Cancella ENTRAMBE le persistenze (patch + stelle) — l'utente ha premuto "Clear Memory"
     [_savedPatchCache removeAllObjects];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:kPatchDefaultsKey];
+    [_starredCache removeAllObjects];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kStarDefaultsKey];
 
     // Ripristina GPU: handler con flag a 0 → applyPatchesForEntry rimuove variant pipeline
     void (^handler)(ShaderEntry *) = self.patchChangedHandler;
@@ -2377,6 +2454,50 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
 
 // ── Export: genera il file .m e lo mostra nel tab ────────────────────────────
 
+// Helper: estrae nomi funzione dalla source di un binary metallib entry.
+// La source contiene righe come "//   fp_main" (lista Funzioni)
+// oppure "// ── fragment: fp_main ──" (dopo AIR reflection).
+static NSArray<NSString *> *_fmExtractBinaryFuncNames(NSString *source) {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSString *line in [source componentsSeparatedByString:@"\n"]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (t.length < 4) continue;
+        // "//   funcName" — lista da "// Funzioni:"
+        if ([t hasPrefix:@"//   "] && t.length > 5) {
+            NSString *n = [[t substringFromIndex:5]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (n.length > 0 && ![n hasPrefix:@"//"] && ![names containsObject:n])
+                [names addObject:n];
+        }
+        // "// ── fragment: funcName ──" o "// ── vertex: funcName ──"
+        else if ([t hasPrefix:@"// ──"]) {
+            NSRange colonRange = [t rangeOfString:@": "];
+            if (colonRange.location == NSNotFound) continue;
+            NSString *rest = [t substringFromIndex:NSMaxRange(colonRange)];
+            NSRange dashRange = [rest rangeOfString:@" ──"];
+            NSString *n = dashRange.location != NSNotFound
+                ? [rest substringToIndex:dashRange.location]
+                : rest;
+            n = [n stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (n.length > 0 && ![names containsObject:n])
+                [names addObject:n];
+        }
+    }
+    return [names copy];
+}
+
+// Helper: restituisce YES se la source è interamente commenti (binary metallib entry).
+static BOOL _fmSourceIsBinary(NSString *source) {
+    BOOL hasAny = NO;
+    for (NSString *line in [source componentsSeparatedByString:@"\n"]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (t.length == 0) continue;
+        hasAny = YES;
+        if (![t hasPrefix:@"//"]) return NO;
+    }
+    return hasAny;
+}
+
 - (void)_regenerateExportSource {
     NSMutableArray<ShaderEntry *> *saved = [NSMutableArray array];
     for (ShaderEntry *e in self.shaders) {
@@ -2390,100 +2511,399 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *fmSmartAliases(void) {
         return;
     }
 
+    // ── Dividi in MSL source e binary metallib ───────────────────────────────
+    NSMutableArray<ShaderEntry *> *mslEntries    = [NSMutableArray array];
+    NSMutableArray<ShaderEntry *> *binaryEntries = [NSMutableArray array];
+    for (ShaderEntry *e in saved) {
+        if (_fmSourceIsBinary(e.source)) [binaryEntries addObject:e];
+        else                             [mslEntries    addObject:e];
+    }
+
     NSMutableString *src = [NSMutableString string];
 
     // ── Header ──────────────────────────────────────────────────────────────
     NSDateFormatter *df = [NSDateFormatter new];
     df.dateFormat = @"yyyy-MM-dd HH:mm";
+    NSMutableArray<NSString *> *installCalls = [NSMutableArray array];
+    if (mslEntries.count)    [installCalls addObject:@"FM_installPatches(device)"];
+    if (binaryEntries.count) [installCalls addObject:@"FM_installBinaryPatches(device)"];
+
     [src appendFormat:
         @"// exported_patches.m\n"
          "// Generato da Metal Inspector — %@\n"
-         "// Shaders: %lu\n"
+         "// MSL source: %lu  |  Binary metallib: %lu\n"
          "//\n"
-         "// Come usarlo:\n"
+         "// Come usarlo (si installa DA SOLO — nessuna modifica a Tweak.xm necessaria):\n"
          "//   1. Copia questo file nella cartella del tuo progetto Theos\n"
-         "//   2. Nel Makefile aggiungi: <TARGET>_FILES = Tweak.xm exported_patches.m\n"
-         "//   3. In Tweak.xm includi: extern void FM_installPatches(id<MTLDevice>);\n"
-         "//      e chiamalo dove ottieni il device.\n"
-         "//   4. make package\n\n"
+         "//   2. Nel Makefile: <TARGET>_FILES = Tweak.xm exported_patches.m\n"
+         "//   3. make package\n"
+         "//\n"
+         "// Opzionale — controllo manuale da Tweak.xm:\n"
+         "//   extern BOOL _fmbActive;  // imposta NO per disabilitare, YES per riabilitare\n\n"
          "#import <Metal/Metal.h>\n"
          "#import <objc/runtime.h>\n\n",
         [df stringFromDate:[NSDate date]],
-        (unsigned long)saved.count];
+        (unsigned long)mslEntries.count,
+        (unsigned long)binaryEntries.count];
 
-    // ── Inject helpers (copiati inline, headless) ────────────────────────────
-    [src appendString:
-        @"// ── Inject helpers ──────────────────────────────────────────────────\n"
-         "static NSString *_fm_injectFragColor(NSString *s,float r,float g,float b){\n"
-         "    // trova ultimo return nel fragment body e aggiunge override RGB\n"
-         "    NSRange ret=[s rangeOfString:@\"return\" options:NSBackwardsSearch];\n"
-         "    if(ret.location==NSNotFound) return s;\n"
-         "    NSRange semi=[s rangeOfString:@\";\" options:0 range:NSMakeRange(ret.location,s.length-ret.location)];\n"
-         "    if(semi.location==NSNotFound) return s;\n"
-         "    NSRange expr=NSMakeRange(ret.location+6, semi.location-(ret.location+6));\n"
-         "    NSString *v=[[s substringWithRange:expr] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];\n"
-         "    NSString *patch=[NSString stringWithFormat:@\"%@.r=(half)%.4ff;%@.g=(half)%.4ff;%@.b=(half)%.4ff;return %@;\",v,r,v,g,v,b,v];\n"
-         "    return [s stringByReplacingCharactersInRange:NSMakeRange(ret.location,semi.location-ret.location+1) withString:patch];\n"
-         "}\n"
-         "static NSString *_fm_injectVertexDepth(NSString *s){\n"
-         "    NSRange ret=[s rangeOfString:@\"return\" options:NSBackwardsSearch];\n"
-         "    if(ret.location==NSNotFound) return s;\n"
-         "    NSRange semi=[s rangeOfString:@\";\" options:0 range:NSMakeRange(ret.location,s.length-ret.location)];\n"
-         "    if(semi.location==NSNotFound) return s;\n"
-         "    NSRange expr=NSMakeRange(ret.location+6, semi.location-(ret.location+6));\n"
-         "    NSString *v=[[s substringWithRange:expr] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];\n"
-         "    NSString *patch=[NSString stringWithFormat:@\"%@.position.z=%@.position.w*0.0001f;return %@;\",v,v,v];\n"
-         "    return [s stringByReplacingCharactersInRange:NSMakeRange(ret.location,semi.location-ret.location+1) withString:patch];\n"
-         "}\n\n"];
+    // ════════════════════════════════════════════════════════════════════════
+    // SECTION A — MSL Source Patches (newLibraryWithSource:)
+    // ════════════════════════════════════════════════════════════════════════
+    if (mslEntries.count > 0) {
+        [src appendString:
+            @"// ════════════════════════════════════════════════════════════════════\n"
+             "// SECTION A — MSL Source Patches\n"
+             "// ════════════════════════════════════════════════════════════════════\n\n"];
 
-    // ── Patch table: one entry per saved shader ──────────────────────────────
-    [src appendString:@"// ── Patch table (name → source length → patch type) ────────────────\n"];
-    [src appendString:@"typedef struct { const char *name; NSUInteger len; int patchType; float r,g,b; } FMPatchEntry;\n"];
-    [src appendString:@"// patchType: 0=none 1=red 2=green 3=blue 4=flash 5=vertex\n"];
-    [src appendString:@"static const FMPatchEntry kFMPatches[] = {\n"];
+        // Inject helpers
+        [src appendString:
+            @"static NSString *_fm_injectFragColor(NSString *s,float r,float g,float b){\n"
+             "    NSRange ret=[s rangeOfString:@\"return\" options:NSBackwardsSearch];\n"
+             "    if(ret.location==NSNotFound) return s;\n"
+             "    NSRange semi=[s rangeOfString:@\";\" options:0 range:NSMakeRange(ret.location,s.length-ret.location)];\n"
+             "    if(semi.location==NSNotFound) return s;\n"
+             "    NSRange expr=NSMakeRange(ret.location+6,semi.location-(ret.location+6));\n"
+             "    NSString *v=[[s substringWithRange:expr] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];\n"
+             "    NSString *patch=[NSString stringWithFormat:@\"%@.r=(half)%.4ff;%@.g=(half)%.4ff;%@.b=(half)%.4ff;return %@;\",v,r,v,g,v,b,v];\n"
+             "    return [s stringByReplacingCharactersInRange:NSMakeRange(ret.location,semi.location-ret.location+1) withString:patch];\n"
+             "}\n"
+             "static NSString *_fm_injectVertexDepth(NSString *s){\n"
+             "    NSRange ret=[s rangeOfString:@\"return\" options:NSBackwardsSearch];\n"
+             "    if(ret.location==NSNotFound) return s;\n"
+             "    NSRange semi=[s rangeOfString:@\";\" options:0 range:NSMakeRange(ret.location,s.length-ret.location)];\n"
+             "    if(semi.location==NSNotFound) return s;\n"
+             "    NSRange expr=NSMakeRange(ret.location+6,semi.location-(ret.location+6));\n"
+             "    NSString *v=[[s substringWithRange:expr] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];\n"
+             "    NSString *patch=[NSString stringWithFormat:@\"%@.position.z=%@.position.w*0.0001f;return %@;\",v,v,v];\n"
+             "    return [s stringByReplacingCharactersInRange:NSMakeRange(ret.location,semi.location-ret.location+1) withString:patch];\n"
+             "}\n\n"];
 
-    for (ShaderEntry *e in saved) {
-        NSString *name = (e.customName.length ? e.customName : e.name);
-        // Escape quotes in name
-        name = [name stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-        int ptype = 0;
-        float r=0,g=0,b=0;
-        if (e.patchVertex)                          { ptype=5; }
-        else if (e.patchFlash)                      { ptype=4; }
-        else if (e.patchFragColor==FragPatchRed)    { ptype=1; r=1.0f; }
-        else if (e.patchFragColor==FragPatchGreen)  { ptype=2; g=0.9f; b=0.2f; }
-        else if (e.patchFragColor==FragPatchBlue)   { ptype=3; r=0.2f; g=0.5f; b=1.0f; }
-        [src appendFormat:@"    { \"%@\", %lu, %d, %.4ff, %.4ff, %.4ff },\n",
-            name, (unsigned long)e.source.length, ptype, r, g, b];
+        // Patch table
+        [src appendString:@"typedef struct{const char*name;NSUInteger len;int patchType;float r,g,b;}FMPatchEntry;\n"];
+        [src appendString:@"// patchType: 0=none 1=red 2=green 3=blue 4=flash 5=vertex\n"];
+        [src appendString:@"static const FMPatchEntry kFMPatches[]={\n"];
+        for (ShaderEntry *e in mslEntries) {
+            NSString *name = (e.customName.length ? e.customName : e.name);
+            name = [name stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+            int ptype=0; float r=0,g=0,b=0;
+            if      (e.patchVertex)                       { ptype=5; }
+            else if (e.patchFlash)                        { ptype=4; }
+            else if (e.patchFragColor==FragPatchRed)      { ptype=1; r=1.0f; }
+            else if (e.patchFragColor==FragPatchGreen)    { ptype=2; g=0.9f; b=0.2f; }
+            else if (e.patchFragColor==FragPatchBlue)     { ptype=3; r=0.2f; g=0.5f; b=1.0f; }
+            [src appendFormat:@"    {\"%@\",%lu,%d,%.4ff,%.4ff,%.4ff},\n",
+                name,(unsigned long)e.source.length,ptype,r,g,b];
+        }
+        [src appendString:@"};\n"];
+        [src appendFormat:@"static const NSUInteger kFMPatchCount=%lu;\n\n",(unsigned long)mslEntries.count];
+
+        // Hook
+        [src appendString:
+            @"typedef id<MTLLibrary>(*_FMLibIMP)(id,SEL,NSString*,MTLCompileOptions*,NSError**);\n"
+             "static _FMLibIMP _fm_origNewLib=NULL;\n"
+             "static id<MTLLibrary> _fm_hookedNewLib(id self,SEL _cmd,NSString*src,MTLCompileOptions*opts,NSError**err){\n"
+             "    for(NSUInteger i=0;i<kFMPatchCount;i++){\n"
+             "        const FMPatchEntry*p=&kFMPatches[i];\n"
+             "        if(src.length!=p->len) continue;\n"
+             "        switch(p->patchType){\n"
+             "            case 1:case 2:case 3: src=_fm_injectFragColor(src,p->r,p->g,p->b); break;\n"
+             "            case 5: src=_fm_injectVertexDepth(src); break;\n"
+             "            default: break;\n"
+             "        }\n"
+             "        break;\n"
+             "    }\n"
+             "    return _fm_origNewLib(self,_cmd,src,opts,err);\n"
+             "}\n"
+             "void FM_installPatches(id<MTLDevice> device){\n"
+             "    if(!device||_fm_origNewLib) return;\n"
+             "    Method m=class_getInstanceMethod([device class],@selector(newLibraryWithSource:options:error:));\n"
+             "    if(m){_fm_origNewLib=(_FMLibIMP)method_getImplementation(m);\n"
+             "          method_setImplementation(m,(IMP)_fm_hookedNewLib);}\n"
+             "}\n\n"];
     }
-    [src appendString:@"};\n"];
-    [src appendFormat:@"static const NSUInteger kFMPatchCount = %lu;\n\n", (unsigned long)saved.count];
 
-    // ── Hook implementation ──────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════════════════
+    // SECTION B — Binary Metallib Patches (newLibraryWithData: + pipeline hooks)
+    // ════════════════════════════════════════════════════════════════════════
+    if (binaryEntries.count > 0) {
+        [src appendString:
+            @"// ════════════════════════════════════════════════════════════════════\n"
+             "// SECTION B — Binary Metallib Patches\n"
+             "// Funziona con shader .metallib precompilati (es. Battle Prime).\n"
+             "// Identificazione stabile: nomi funzione (non il hash, che è salted per-processo).\n"
+             "// Chiama FM_installBinaryPatches(device) dove ottieni il MTLDevice.\n"
+             "// ════════════════════════════════════════════════════════════════════\n\n"];
+
+        // ── Deduplica per set di nomi funzione ──────────────────────────────
+        // Più ShaderEntry possono appartenere allo stesso metallib.
+        // Ogni metallib viene emesso una volta sola, con la patch più "forte".
+        NSMutableArray<NSArray<NSString *>*> *libFuncSets = [NSMutableArray array];
+        NSMutableArray<NSNumber *>           *libPTypes   = [NSMutableArray array];
+        NSMutableArray<NSNumber *>           *libRs       = [NSMutableArray array];
+        NSMutableArray<NSNumber *>           *libGs       = [NSMutableArray array];
+        NSMutableArray<NSNumber *>           *libBs       = [NSMutableArray array];
+
+        for (ShaderEntry *e in binaryEntries) {
+            NSArray<NSString *> *names = _fmExtractBinaryFuncNames(e.source);
+            if (names.count == 0) continue;
+            NSArray<NSString *> *sorted = [names sortedArrayUsingSelector:@selector(compare:)];
+
+            // Controlla se già presente
+            NSInteger existing = -1;
+            for (NSInteger i = 0; i < (NSInteger)libFuncSets.count; i++) {
+                if ([libFuncSets[(NSUInteger)i] isEqualToArray:sorted]) { existing = i; break; }
+            }
+
+            int ptype=0; float r=0,g=0,b=0;
+            if      (e.patchVertex)                    { ptype=5; }
+            else if (e.patchFlash)                     { ptype=4; }
+            else if (e.patchFragColor==FragPatchRed)   { ptype=1; r=1.0f; }
+            else if (e.patchFragColor==FragPatchGreen) { ptype=2; g=0.9f; b=0.2f; }
+            else if (e.patchFragColor==FragPatchBlue)  { ptype=3; r=0.2f; g=0.5f; b=1.0f; }
+
+            if (existing < 0) {
+                [libFuncSets addObject:sorted];
+                [libPTypes   addObject:@(ptype)];
+                [libRs       addObject:@(r)];
+                [libGs       addObject:@(g)];
+                [libBs       addObject:@(b)];
+            } else if (ptype > 0 && libPTypes[(NSUInteger)existing].intValue == 0) {
+                // Aggiorna patch se prima era none
+                libPTypes[(NSUInteger)existing] = @(ptype);
+                libRs[(NSUInteger)existing] = @(r);
+                libGs[(NSUInteger)existing] = @(g);
+                libBs[(NSUInteger)existing] = @(b);
+            }
+        }
+
+        // ── Emetti array nomi funzione ───────────────────────────────────────
+        for (NSUInteger i = 0; i < libFuncSets.count; i++) {
+            NSArray<NSString *> *fns = libFuncSets[i];
+            [src appendFormat:@"// Binary lib %lu: %@\n", (unsigned long)i,
+                [fns componentsJoinedByString:@", "]];
+            [src appendFormat:@"static const char *_fmBinFns_%lu[]={", (unsigned long)i];
+            for (NSString *fn in fns) {
+                NSString *escaped = [fn stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+                [src appendFormat:@"\"%@\",", escaped];
+            }
+            [src appendString:@"NULL};\n"];
+        }
+
+        // ── Patch table ──────────────────────────────────────────────────────
+        [src appendString:@"\ntypedef struct{const char**fns;int patchType;float r,g,b;}_FMBinLib;\n"];
+        [src appendString:@"// patchType: 0=none 1=red 2=green 3=blue 4=flash 5=wallhack\n"];
+        [src appendString:@"static const _FMBinLib kFMBinLibs[]={\n"];
+        for (NSUInteger i = 0; i < libFuncSets.count; i++) {
+            [src appendFormat:@"    {_fmBinFns_%lu,%d,%.4ff,%.4ff,%.4ff},\n",
+                (unsigned long)i,
+                libPTypes[i].intValue,
+                libRs[i].floatValue, libGs[i].floatValue, libBs[i].floatValue];
+        }
+        [src appendString:@"};\n"];
+        [src appendFormat:@"#define kFMBinLibCount %lu\n\n", (unsigned long)libFuncSets.count];
+
+        // ── Runtime hook completo ────────────────────────────────────────────
+        [src appendString:
+            @"// ── State ────────────────────────────────────────────────────────────\n"
+             "static const char _fmbLibIdxKey=0,_fmbFnIdxKey=0,_fmbPipeIdxKey=0,_fmbEncWallKey=0;\n"
+             "static NSMutableDictionary *_fmbColorVariants; // NSValue(ps*) → id<MTLRenderPipelineState>\n"
+             "static id<MTLLibrary> _fmbColorLibs[4];        // index=patchType 1..3\n"
+             "static id _fmbWallhackDepthState;\n"
+             "static NSObject *_fmbLock;\n"
+             "static id<MTLDevice> _fmbDevice;\n"
+             "BOOL _fmbActive=YES; // imposta a NO per disabilitare senza riavvio\n\n"
+             "// ── Compilatore fmColorPatch ──────────────────────────────────────────\n"
+             "static void _fmbBuildColorLib(int pt,float r,float g,float b){\n"
+             "    if(pt<1||pt>3||!_fmbDevice) return;\n"
+             "    @synchronized(_fmbLock){if(_fmbColorLibs[pt]) return;}\n"
+             "    NSString*msl=[NSString stringWithFormat:\n"
+             "        @\"#include <metal_stdlib>\\nusing namespace metal;\\n\"\n"
+             "         \"fragment float4 fmColorPatch(\"\n"
+             "         \"[[position]] float4 p[[position]])\"\n"
+             "         \"{return float4(%.4f,%.4f,%.4f,1.0);}\",r,g,b];\n"
+             "    NSError*e=nil;\n"
+             "    id<MTLLibrary>lib=[_fmbDevice newLibraryWithSource:msl options:nil error:&e];\n"
+             "    if(lib) @synchronized(_fmbLock){if(!_fmbColorLibs[pt]) _fmbColorLibs[pt]=lib;}\n"
+             "}\n\n"
+             "// ── Match lib per nomi funzione ───────────────────────────────────────\n"
+             "static int _fmbMatchLib(id<MTLLibrary>lib){\n"
+             "    NSArray<NSString*>*fns=[lib functionNames];\n"
+             "    for(int i=0;i<kFMBinLibCount;i++){\n"
+             "        const char**p=kFMBinLibs[i].fns;int ok=0,tot=0;\n"
+             "        for(;*p;p++,tot++){for(NSString*f in fns){if(strcmp(f.UTF8String,*p)==0){ok++;break;}}}\n"
+             "        if(tot>0&&ok==tot) return i;\n"
+             "    }\n"
+             "    return -1;\n"
+             "}\n\n"
+             "// ── Hook: newFunctionWithName: ────────────────────────────────────────\n"
+             "typedef id<MTLFunction>(*_FmbFnIMP)(id,SEL,NSString*);\n"
+             "static _FmbFnIMP _fmbOrigFn=NULL;\n"
+             "static id<MTLFunction> _fmbHookedFn(id self,SEL c,NSString*name){\n"
+             "    id<MTLFunction>fn=_fmbOrigFn(self,c,name);\n"
+             "    if(fn){NSNumber*idx=objc_getAssociatedObject(self,&_fmbLibIdxKey);\n"
+             "        if(idx) objc_setAssociatedObject(fn,&_fmbFnIdxKey,idx,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}\n"
+             "    return fn;\n"
+             "}\n\n"
+             "// ── Track pipeline state → indice lib ─────────────────────────────────\n"
+             "typedef id<MTLRenderPipelineState>(*_FmbPipeIMP)(id,SEL,MTLRenderPipelineDescriptor*,NSError**);\n"
+             "static _FmbPipeIMP _fmbOrigPipe=NULL;\n"
+             "static void _fmbTrackPS(id<MTLRenderPipelineState>ps,MTLRenderPipelineDescriptor*desc){\n"
+             "    if(!ps||!desc) return;\n"
+             "    NSNumber*fi=objc_getAssociatedObject(desc.fragmentFunction,&_fmbFnIdxKey);\n"
+             "    NSNumber*vi=objc_getAssociatedObject(desc.vertexFunction,&_fmbFnIdxKey);\n"
+             "    NSNumber*idx=fi?:vi; if(!idx) return;\n"
+             "    objc_setAssociatedObject(ps,&_fmbPipeIdxKey,idx,OBJC_ASSOCIATION_RETAIN_NONATOMIC);\n"
+             "    int pt=kFMBinLibs[idx.intValue].patchType;\n"
+             "    if(pt<1||pt>3) return;\n"
+             "    id<MTLLibrary>cl; @synchronized(_fmbLock){cl=_fmbColorLibs[pt];}\n"
+             "    if(!cl) return;\n"
+             "    NSValue*pk=[NSValue valueWithPointer:(__bridge void*)ps];\n"
+             "    @synchronized(_fmbLock){if(_fmbColorVariants[pk]) return;}\n"
+             "    MTLRenderPipelineDescriptor*d=[desc copy];\n"
+             "    id<MTLFunction>fn=[cl newFunctionWithName:@\"fmColorPatch\"];\n"
+             "    if(!fn) return;\n"
+             "    d.fragmentFunction=fn;\n"
+             "    for(NSUInteger a=0;a<8;a++) if(d.colorAttachments[a].pixelFormat!=0){\n"
+             "        d.colorAttachments[a].blendingEnabled=NO;\n"
+             "        d.colorAttachments[a].writeMask=MTLColorWriteMaskAll;}\n"
+             "    NSError*err=nil;\n"
+             "    id<MTLRenderPipelineState>vp=_fmbOrigPipe(_fmbDevice,\n"
+             "        @selector(newRenderPipelineStateWithDescriptor:error:),d,&err);\n"
+             "    if(vp) @synchronized(_fmbLock){_fmbColorVariants[pk]=vp;}\n"
+             "}\n\n"
+             "// ── Hook: newRenderPipelineStateWithDescriptor:error: ─────────────────\n"
+             "static id<MTLRenderPipelineState> _fmbHookedPipe(id self,SEL c,MTLRenderPipelineDescriptor*d,NSError**e){\n"
+             "    id<MTLRenderPipelineState>ps=_fmbOrigPipe(self,c,d,e);\n"
+             "    if(ps) _fmbTrackPS(ps,d); return ps;\n"
+             "}\n\n"
+             "// ── Hook: newRenderPipelineStateWithDescriptor:completionHandler: ──────\n"
+             "typedef void(*_FmbPipeAsyncIMP)(id,SEL,MTLRenderPipelineDescriptor*,MTLNewRenderPipelineStateCompletionHandler);\n"
+             "static _FmbPipeAsyncIMP _fmbOrigPipeAsync=NULL;\n"
+             "static void _fmbHookedPipeAsync(id self,SEL c,MTLRenderPipelineDescriptor*d,\n"
+             "                                MTLNewRenderPipelineStateCompletionHandler h){\n"
+             "    _fmbOrigPipeAsync(self,c,d,^(id<MTLRenderPipelineState>ps,NSError*e){\n"
+             "        if(ps) _fmbTrackPS(ps,d); if(h) h(ps,e);\n"
+             "    });\n"
+             "}\n\n"
+             "// ── Hook: setRenderPipelineState: ────────────────────────────────────\n"
+             "typedef void(*_FmbSetPipeIMP)(id,SEL,id<MTLRenderPipelineState>);\n"
+             "static _FmbSetPipeIMP _fmbOrigSetPipe=NULL;\n"
+             "static void _fmbHookedSetPipe(id self,SEL c,id<MTLRenderPipelineState>ps){\n"
+             "    objc_setAssociatedObject(self,&_fmbEncWallKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);\n"
+             "    if(_fmbActive&&ps){\n"
+             "        NSNumber*idx=objc_getAssociatedObject(ps,&_fmbPipeIdxKey);\n"
+             "        if(idx){\n"
+             "            int pt=kFMBinLibs[idx.intValue].patchType;\n"
+             "            if(pt==5){\n"
+             "                objc_setAssociatedObject(self,&_fmbEncWallKey,@YES,OBJC_ASSOCIATION_RETAIN_NONATOMIC);\n"
+             "            } else if(pt>=1&&pt<=3){\n"
+             "                NSValue*pk=[NSValue valueWithPointer:(__bridge void*)ps];\n"
+             "                id<MTLRenderPipelineState>vp;\n"
+             "                @synchronized(_fmbLock){vp=_fmbColorVariants[pk];}\n"
+             "                if(vp){_fmbOrigSetPipe(self,c,vp);return;}\n"
+             "            }\n"
+             "        }\n"
+             "    }\n"
+             "    _fmbOrigSetPipe(self,c,ps);\n"
+             "}\n\n"
+             "// ── Hook: setDepthStencilState: ──────────────────────────────────────\n"
+             "typedef void(*_FmbDepthIMP)(id,SEL,id);\n"
+             "static _FmbDepthIMP _fmbOrigDepth=NULL;\n"
+             "static void _fmbHookedDepth(id self,SEL c,id ds){\n"
+             "    if(_fmbActive&&_fmbWallhackDepthState&&\n"
+             "       objc_getAssociatedObject(self,&_fmbEncWallKey)){\n"
+             "        _fmbOrigDepth(self,c,_fmbWallhackDepthState);return;\n"
+             "    }\n"
+             "    _fmbOrigDepth(self,c,ds);\n"
+             "}\n\n"
+             "// ── Installa hook su classe encoder (una volta sola) ──────────────────\n"
+             "static void _fmbHookEncoderClass(Class cls){\n"
+             "    {Method m=class_getInstanceMethod(cls,@selector(setRenderPipelineState:));\n"
+             "     if(m&&!_fmbOrigSetPipe){_fmbOrigSetPipe=(_FmbSetPipeIMP)method_getImplementation(m);\n"
+             "         method_setImplementation(m,(IMP)_fmbHookedSetPipe);}}\n"
+             "    {Method m=class_getInstanceMethod(cls,@selector(setDepthStencilState:));\n"
+             "     if(m&&!_fmbOrigDepth){_fmbOrigDepth=(_FmbDepthIMP)method_getImplementation(m);\n"
+             "         method_setImplementation(m,(IMP)_fmbHookedDepth);}}\n"
+             "}\n\n"
+             "// ── Hook: renderCommandEncoderWithDescriptor: ─────────────────────────\n"
+             "typedef id(*_FmbEncIMP)(id,SEL,MTLRenderPassDescriptor*);\n"
+             "static _FmbEncIMP _fmbOrigEnc=NULL;\n"
+             "static id _fmbHookedEnc(id self,SEL c,MTLRenderPassDescriptor*d){\n"
+             "    id enc=_fmbOrigEnc(self,c,d);\n"
+             "    if(enc){static dispatch_once_t o;dispatch_once(&o,^{\n"
+             "        _fmbHookEncoderClass(object_getClass(enc));});\n"
+             "    }\n"
+             "    return enc;\n"
+             "}\n\n"
+             "// ── Hook: newLibraryWithData:error: ──────────────────────────────────\n"
+             "typedef id<MTLLibrary>(*_FmbDataIMP)(id,SEL,dispatch_data_t,NSError**);\n"
+             "static _FmbDataIMP _fmbOrigData=NULL;\n"
+             "static id<MTLLibrary> _fmbHookedData(id self,SEL c,dispatch_data_t d,NSError**e){\n"
+             "    id<MTLLibrary>lib=_fmbOrigData(self,c,d,e);\n"
+             "    if(!lib) return lib;\n"
+             "    int idx=_fmbMatchLib(lib);\n"
+             "    if(idx>=0){\n"
+             "        objc_setAssociatedObject(lib,&_fmbLibIdxKey,@(idx),OBJC_ASSOCIATION_RETAIN_NONATOMIC);\n"
+             "        static dispatch_once_t once;\n"
+             "        dispatch_once(&once,^{\n"
+             "            Method m=class_getInstanceMethod(object_getClass(lib),@selector(newFunctionWithName:));\n"
+             "            if(m&&!_fmbOrigFn){_fmbOrigFn=(_FmbFnIMP)method_getImplementation(m);\n"
+             "                method_setImplementation(m,(IMP)_fmbHookedFn);}\n"
+             "        });\n"
+             "        int pt=kFMBinLibs[idx].patchType;\n"
+             "        if(pt>=1&&pt<=3){\n"
+             "            float r=kFMBinLibs[idx].r,g=kFMBinLibs[idx].g,b=kFMBinLibs[idx].b;\n"
+             "            dispatch_async(dispatch_get_global_queue(0,0),^{_fmbBuildColorLib(pt,r,g,b);});\n"
+             "        }\n"
+             "    }\n"
+             "    return lib;\n"
+             "}\n\n"
+             "// ── FM_installBinaryPatches — chiama una volta con il MTLDevice ────────\n"
+             "void FM_installBinaryPatches(id<MTLDevice> device){\n"
+             "    if(!device||_fmbOrigData) return;\n"
+             "    _fmbDevice=device;\n"
+             "    _fmbLock=[NSObject new];\n"
+             "    _fmbColorVariants=[NSMutableDictionary new];\n"
+             "    // Wallhack: depth always-pass\n"
+             "    MTLDepthStencilDescriptor*dd=[MTLDepthStencilDescriptor new];\n"
+             "    dd.depthCompareFunction=MTLCompareFunctionAlways;\n"
+             "    dd.depthWriteEnabled=NO;\n"
+             "    _fmbWallhackDepthState=[device newDepthStencilStateWithDescriptor:dd];\n"
+             "    Class dc=[device class];\n"
+             "    {Method m=class_getInstanceMethod(dc,@selector(newLibraryWithData:error:));\n"
+             "     if(m){_fmbOrigData=(_FmbDataIMP)method_getImplementation(m);\n"
+             "         method_setImplementation(m,(IMP)_fmbHookedData);}}\n"
+             "    {Method m=class_getInstanceMethod(dc,@selector(newRenderPipelineStateWithDescriptor:error:));\n"
+             "     if(m){_fmbOrigPipe=(_FmbPipeIMP)method_getImplementation(m);\n"
+             "         method_setImplementation(m,(IMP)_fmbHookedPipe);}}\n"
+             "    {Method m=class_getInstanceMethod(dc,@selector(newRenderPipelineStateWithDescriptor:completionHandler:));\n"
+             "     if(m){_fmbOrigPipeAsync=(_FmbPipeAsyncIMP)method_getImplementation(m);\n"
+             "         method_setImplementation(m,(IMP)_fmbHookedPipeAsync);}}\n"
+             "    // Recupera la classe encoder via command buffer\n"
+             "    id<MTLCommandQueue>q=[device newCommandQueue];\n"
+             "    if(q){id<MTLCommandBuffer>cb=[q commandBuffer];\n"
+             "        if(cb){Class cbc=object_getClass(cb);\n"
+             "            Method m=class_getInstanceMethod(cbc,@selector(renderCommandEncoderWithDescriptor:));\n"
+             "            if(m&&!_fmbOrigEnc){_fmbOrigEnc=(_FmbEncIMP)method_getImplementation(m);\n"
+             "                method_setImplementation(m,(IMP)_fmbHookedEnc);}}}\n"
+             "}\n"];
+    }
+
+    // ── Costruttore auto-install ─────────────────────────────────────────────
+    // MTLCreateSystemDefaultDevice() è API pubblica Metal.
+    // Il costruttore viene eseguito al caricamento del tweak (prima di main),
+    // quindi i hook sono già installati quando il gioco inizia a creare shader.
     [src appendString:
-        @"// ── Runtime hook ────────────────────────────────────────────────────\n"
-         "typedef id<MTLLibrary>(*_FMLibIMP)(id,SEL,NSString*,MTLCompileOptions*,NSError**);\n"
-         "static _FMLibIMP _fm_origNewLib = NULL;\n\n"
-         "static id<MTLLibrary> _fm_hookedNewLib(id self,SEL _cmd,NSString *src,MTLCompileOptions *opts,NSError **err){\n"
-         "    for(NSUInteger i=0;i<kFMPatchCount;i++){\n"
-         "        const FMPatchEntry *p=&kFMPatches[i];\n"
-         "        if(src.length!=p->len) continue;\n"
-         "        switch(p->patchType){\n"
-         "            case 1: case 2: case 3: src=_fm_injectFragColor(src,p->r,p->g,p->b); break;\n"
-         "            case 5: src=_fm_injectVertexDepth(src); break;\n"
-         "            default: break;\n"
-         "        }\n"
-         "        break;\n"
-         "    }\n"
-         "    return _fm_origNewLib(self,_cmd,src,opts,err);\n"
-         "}\n\n"
-         "void FM_installPatches(id<MTLDevice> device){\n"
-         "    if(!device||_fm_origNewLib) return;\n"
-         "    Class cls=[device class];\n"
-         "    Method m=class_getInstanceMethod(cls,@selector(newLibraryWithSource:options:error:));\n"
-         "    if(m){ _fm_origNewLib=(_FMLibIMP)method_getImplementation(m);\n"
-         "            method_setImplementation(m,(IMP)_fm_hookedNewLib); }\n"
-         "}\n"];
+        @"// ── Auto-install (nessuna azione richiesta nel Tweak.xm) ────────────────\n"
+         "__attribute__((constructor))\n"
+         "static void _fmAutoInstall(void) {\n"
+         "    id<MTLDevice> device = MTLCreateSystemDefaultDevice();\n"
+         "    if (!device) return;\n"];
+    if (mslEntries.count > 0)
+        [src appendString:@"    FM_installPatches(device);\n"];
+    if (binaryEntries.count > 0)
+        [src appendString:@"    FM_installBinaryPatches(device);\n"];
+    [src appendString:@"}\n"];
 
     _exportTextView.text = src;
 }
@@ -2552,7 +2972,11 @@ static BOOL fmSourceIsObfuscated(NSString *src) {
 
 // Returns YES if source is a placeholder generated for a precompiled .metallib.
 static BOOL fmSourceIsBinary(NSString *src) {
-    return [src hasPrefix:@"// ⚠️  METALLIB PRECOMPILATA"];
+    return [src hasPrefix:@"// ⚠️  METALLIB PRECOMPILATA"] ||
+           [src hasPrefix:@"// ── METALLIB"]              ||
+           [src hasPrefix:@"// METALLIB"]                 ||
+           [src hasPrefix:@"// DEFAULT METALLIB"]         ||
+           [src hasPrefix:@"// ⚠️  LIBRERIA NON-MSL"];   // lateTagLibrary (pipeline-triggered)
 }
 
 - (void)showDetailForShader:(ShaderEntry *)shader {
@@ -2595,7 +3019,7 @@ static BOOL fmSourceIsBinary(NSString *src) {
         if (isBin) {
             obfBanner.backgroundColor = [UIColor colorWithRed:0.1 green:0.25 blue:0.55 alpha:1];
             obfBanner.textColor = [UIColor colorWithRed:0.7 green:0.85 blue:1 alpha:1];
-            obfBanner.text = @"  📦  Metallib precompilata — R/G/B/⚡ non disponibili · V wallhack OK  ";
+            obfBanner.text = @"  📦  Metallib precompilata — R/G/B colore + V wallhack disponibili  ";
         } else {
             obfBanner.backgroundColor = [UIColor colorWithRed:0.30 green:0.20 blue:0.0 alpha:1];
             obfBanner.textColor = [UIColor colorWithRed:1 green:0.85 blue:0.3 alpha:1];

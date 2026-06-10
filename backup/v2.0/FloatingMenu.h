@@ -16,6 +16,6 @@
 - (void)show;
 - (void)hide;
 - (void)addLog:(NSString *)message;
-- (void)captureShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error;
+- (void)captureShaderWithName:(NSString *)name source:(NSString *)source error:(NSString *)error libHash:(NSUInteger)libHash;
 
 @end
